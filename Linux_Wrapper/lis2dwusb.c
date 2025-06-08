@@ -190,11 +190,17 @@ int main(int argc, char *argv[])
             float yf = yi * 0.001f;
             float zf = zi * 0.001f;
 
+             // Calculate elapsed time
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            double elapsed_sample = (now.tv_sec - start.tv_sec) + (now.tv_usec - start.tv_usec) / 1e6;
+
+
             // Print to CSV or stdout
             if (csv)
-                fprintf(csv, "%.3f,%.3f,%.3f\n", xf, yf, zf);
+                fprintf(csv, "%.3f,%.3f,%.3f,%.3f\n", elapsed_sample, xf, yf, zf);
             else
-                printf("x = %.3f, y = %.3f, z = %.3f\n", xf, yf, zf);
+                printf("time = %.3f, x = %.3f, y = %.3f, z = %.3f\n", elapsed_sample, xf, yf, zf);
 
             samples++;
         }

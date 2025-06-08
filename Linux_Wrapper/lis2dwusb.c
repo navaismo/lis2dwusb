@@ -124,7 +124,7 @@ int main(int argc, char *argv[])
                 if (strncmp(line, "time,", 5) == 0)
                 {
                     got_header = 1;
-                    fprintf(stderr, "[INFO] Got header: %s\n", line);
+                    //fprintf(stderr, "[INFO] Got header: %s\n", line);
                     break;
                 }
                 line_pos = 0;
@@ -146,7 +146,7 @@ int main(int argc, char *argv[])
     }
 
     // Wde are connected and ready to read data
-    fprintf(stderr, "[INFO] Connected. Press Q to stop.\n");
+    fprintf(stderr, "Press Q to stop\n");
 
     FILE *csv = NULL;
     // If save path is provided, open CSV file
@@ -217,7 +217,7 @@ int main(int argc, char *argv[])
     fclose(serial);
     tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios); // Restore terminal
 
-    fprintf(stderr, "[INFO] Captured %lu samples in %.2f s = %.1f Hz\n",
+    fprintf(stderr, "Captured %lu samples in %.2f s = %.1f Hz\n",
             samples, elapsed, samples / elapsed);
 
     return 0;

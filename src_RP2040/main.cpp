@@ -29,7 +29,7 @@
 #define MISO_PIN 8
 #endif
 
-String fw = "LIS2DW USB accelerometer FW v0.2.0";
+String fw = "LIS2DW USB accelerometer FW v0.2.2 \r\nhttps://github.com/lis2dwusb\r\nby @navaismo";
 
 // Variable to store the sample interval in microseconds
 // If sample_us == 0, it means that we should not read the sensor
@@ -39,7 +39,11 @@ volatile uint32_t sample_us = 0;
 uint32_t t0_us = 0;
 uint32_t next_us = 0;
 uint8_t fs_setting = 0; // Full-scale setting read from CTRL_REG6
+float lsb_per_g = 16384.0f; // We always set the scale at ±2g, so this is the LSB per G value
 
+// Struct to hold axis readings
+// Each axis is represented by two bytes: LSB and MSB
+// The value is stored as a signed 16-bit integer
 union AxisReading
 {
     struct
@@ -151,7 +155,7 @@ void reinitSensor(uint32_t f_hz)
     next_us = t0_us;
 
     // Print the reinitialization information
-    Serial.println("Rebooting to setup new FQ: " + fq + " Hz");
+    Serial.println("Rebooting to setup new Freq: " + fq + " Hz");
     Serial.println(fw);
     Serial.print("WHO_AM_I: 0x");
     Serial.println(lisReadReg(WHO_AM_I_ADDR), HEX);
@@ -201,6 +205,7 @@ void setupLIS2DW()
     next_us = t0_us;
 }
 
+
 void setup()
 {
     Serial.begin(2000000);
@@ -223,22 +228,32 @@ void setup()
     Serial.println(fs_setting, HEX);
 }
 
+// Check if new data is ready
 bool dataReady()
 {
+    // If DRDY bit (bit0) of STATUS_REG is set, it means that new data is ready
     return (lisReadReg(STATUS_REG_ADDR) & 0x01) != 0;
 }
 
+// Read axes X, Y, Z in burst mode
+// This function reads all three axes in one burst read operation
+// It is more efficient than reading each axis separately
 void burstReadAxes(AxisReading &x, AxisReading &y, AxisReading &z)
 {
     // Wait for fresh data
-    while (!dataReady())
-        ;
+    while (!dataReady());
+
     uint8_t buf[6];
     csLow();
+    // Send the read command for OUT_XL_ADDR
     spiPort.write(0x80 | OUT_XL_ADDR); // READ  | OUT_X_L
+    // Read 6 bytes(REG ADDRs) in burst mode
     for (int i = 0; i < 6; i++)
         buf[i] = spiPort.write(0);
+    
+
     csHigh();
+    // Assign the values to the AxisReading structures
     x.low = buf[0];
     x.high = buf[1];
     y.low = buf[2];
@@ -248,6 +263,7 @@ void burstReadAxes(AxisReading &x, AxisReading &y, AxisReading &z)
 }
 
 u_int32_t samples=0;
+// Main loop
 void loop()
 {
     // Process serial bytes (to assemble CMD complete)
@@ -265,9 +281,9 @@ void loop()
             {
                 // It is "F = <n>"
                 uint32_t f = cmd.substring(2).toInt();
-                if (f < 12)
-                    f = 12;
-                if (f > 2000)
+                if (f < 200) // Minimum frequency is 200 Hz
+                    f = 200;
+                if (f > 2000) // Maximum frequency is 2000 Hz
                     f = 2000;
 
                 // Calculate interval in µs and reconfigure ODR
@@ -292,16 +308,9 @@ void loop()
         }
     }
 
-    // If sample_us == 0, it means that we should not read the sensor or not dataready
+    // If sample_us == 0, it means that we should not read the sensor or the Register DRDY has not data ready
     if (sample_us == 0 || !dataReady()) return;
     
-
-    // If sample_us> 0, we take samples cyclically
-    // uint32_t now = micros();
-    // if ((int32_t)(now - next_us) >= 0)
-    // {
-    //     next_us += sample_us;
-
         // Read Axes X, Y, Z.
         // AxisReading x, y, z;
 
@@ -315,45 +324,18 @@ void loop()
         AxisReading x, y, z;
         burstReadAxes(x, y, z);
 
-        // Convert raw values to Gs
-        float xf, yf, zf;
-        {
-            float lsb_per_g;
-            // The full-scale setting is in bits 4-5 of CTRL_REG6
-            switch ((fs_setting >> 4) & 0x03)
-            {
-            case 0x00:
-                lsb_per_g = 16384.0f;
-                break;
-            case 0x01:
-                lsb_per_g = 8192.0f;
-                break;
-            case 0x02:
-                lsb_per_g = 4096.0f;
-                break;
-            case 0x03:
-                lsb_per_g = 2048.0f;
-                break;
-            default:
-                lsb_per_g = 16384.0f;
-            }
-            // Convert raw values to Gs
-            xf = x.value / lsb_per_g;
-            yf = y.value / lsb_per_g;
-            zf = z.value / lsb_per_g;
-        }
+        // Convert raw values to mg (milligravity)
+        int16_t xi = (int16_t)(x.value * 1000 / lsb_per_g);
+        int16_t yi = (int16_t)(y.value * 1000 / lsb_per_g);
+        int16_t zi = (int16_t)(z.value * 1000 / lsb_per_g);
 
-        // Print the data in CSV format
-        //float t = (micros() - t0_us) * 1e-6f;
-        //Serial.print(t, 3);
-        //Serial.print(',');
-        Serial.print(xf, 3);
-        Serial.print(',');
-        Serial.print(yf, 3);
-        Serial.print(',');
-        Serial.println(zf, 3);
 
-        
+        char buf[48];
+        // Send the data in CSV format
+        snprintf(buf, sizeof(buf), "%d,%d,%d", xi, yi, zi);
+        Serial.print(buf);
+        Serial.print("\r\n");
+
         // samples++;
         // if(millis() % 1000 == 0) {
         //    Serial.print("Samples: ");

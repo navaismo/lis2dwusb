@@ -160,7 +160,7 @@ int main(int argc, char *argv[])
             tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
             return 6;
         }
-        fprintf(csv, "x,y,z\n");
+        fprintf(csv, "time,x,y,z\n");
     }
 
     unsigned long samples = 0;

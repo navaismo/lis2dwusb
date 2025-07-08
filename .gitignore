@@ -2,3 +2,6 @@
 .vscode
 .git
 test
+lis2dwusb
+tests/__pycache__/
+*.pyc

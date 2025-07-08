@@ -15,7 +15,7 @@ step "Installing Deps"
 sudo apt-get update
 sudo apt-get install -y build-essential make gcc git pigpio
 
-# Step 2: installing ADXL345SPI Tool (workaround para git como root)
+# Step 2: installing LIS2DWUSB Tool (workaround para git como root)
 step "Installing LIS2DWUSB Tool"
 
 # We detect the real user (for when the script is executed with Sudo)
@@ -34,5 +34,4 @@ else
         sudo tee /etc/sudoers.d/octoprint_lis2dw
 fi
 
-echo -e "\n✔ All steps completed successfully!"
-echo -e "Reboot the system to apply changes.\n"
+echo -e "\n✔ All steps completed successfully!"echo -e "Reboot the system to apply changes.\n"

@@ -23,13 +23,13 @@ This project provides the firmware for using a [BIGTREETECH S2DW](https://github
   - Connect the Board to your machine while keeping pressing the `BOOT` button.
   - Wait for your computer to show the new Storage Device and release the button.
   - Mount and Open the Device.
-  - Copy the Dwonloaded `RP2040_LIS2DW_XXX.uf2` file (Or your complied version `Firmware.uf2`) to the Device.
+  - Copy the Downloaded `RP2040_LIS2DW_XXX.uf2` file (Or your compiled version `Firmware.uf2`) to the Device.
   - When it finish the copy the device will unmount automatically, means the RPi2040 is rebooting.
   - Disconnect the Device from your computer.
-  - Connect the device to your Raspberry Pi Running Octoprint(or the device running Octorpint).
+  - Connect the device to your Raspberry Pi running OctoPrint (or the device running OctoPrint).
 
 
-3. Copy the `Linux_Wrapper` Folder to any location on the Octorpint running Device(Raspberry Pi).
+3. Copy the `Linux_Wrapper` folder to any location on the OctoPrint-running device (Raspberry Pi).
 4. Run the installation script with sudo.
 
    ```bash
@@ -41,10 +41,10 @@ This project provides the firmware for using a [BIGTREETECH S2DW](https://github
 ## Usage
 
 * The `lis2dwusb` wrapper is installed in `/usr/local/bin/`.
-* The Valid Frecuencies for LIS2DW are from 200hz to 1600Hz.
+* The Valid Frequencies for LIS2DW are from 200hz to 1600Hz.
 * The OctoPrint user has direct permission to use this tool without sudo.
 * In OctoPrint-Pinput\_Shaping, point the tool need to configure the option in Plugin Setting.
-* To test from sheel run:
+* To test from shell run:
 
 ```bash
 sudo lis2dwusb -f 1600

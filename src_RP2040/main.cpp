@@ -262,7 +262,7 @@ void burstReadAxes(AxisReading &x, AxisReading &y, AxisReading &z)
     z.high = buf[5];
 }
 
-u_int32_t samples=0;
+uint32_t samples = 0;
 // Main loop
 void loop()
 {

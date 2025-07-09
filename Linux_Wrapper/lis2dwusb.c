@@ -44,10 +44,11 @@ int configure_serial(int fd)
 void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-s file.csv] [-f freq]\n"
-        "  -s file.csv   Save output to CSV file\n"
-        "  -f freq       Sampling frequency (200–1600 Hz)\n",
-        prog);
+            "Usage: %s [-s file.csv] [-f freq] [-h]\n"
+            "  -s file.csv   Save output to CSV file\n"
+            "  -f freq       Sampling frequency (200–1600 Hz)\n"
+            "  -h            Show this help message\n",
+            prog);
     exit(1);
 }
 
@@ -59,7 +60,7 @@ int main(int argc, char *argv[])
 
     // Parse arguments
     int opt;
-    while ((opt = getopt(argc, argv, "s:f:")) != -1)
+    while ((opt = getopt(argc, argv, "hs:f:")) != -1)
     {
         switch (opt)
         {

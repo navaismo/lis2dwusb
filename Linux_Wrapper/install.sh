@@ -33,5 +33,5 @@ else
     echo -e "octoprint ALL=(ALL) NOPASSWD: $(which lis2dwusb)\n$(whoami) ALL=(ALL) NOPASSWD: $(which lis2dwusb)" |
         sudo tee /etc/sudoers.d/octoprint_lis2dw
 fi
-
-echo -e "\n✔ All steps completed successfully!"echo -e "Reboot the system to apply changes.\n"
+echo -e "\n✔ All steps completed successfully!"
+echo -e "Reboot the system to apply changes.\n"

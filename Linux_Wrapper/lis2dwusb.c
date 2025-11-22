@@ -9,16 +9,14 @@
 #include <signal.h>
 #include <sys/time.h>
 
-#define SERIAL_PORT "/dev/ttyACM0"
+#define DEFAULT_SERIAL_PORT "/dev/ttyACM0"
 #define BAUDRATE B2000000
 #define LINE_BUF_SIZE 128
 
 volatile int running = 1;
 void handle_sigint(int _) { running = 0; }
 
-
 // Configure the serial port with the specified baud rate and settings
-// Returns 0 on success, -1 on error
 int configure_serial(int fd)
 {
     struct termios tty;
@@ -40,67 +38,86 @@ int configure_serial(int fd)
     return tcsetattr(fd, TCSANOW, &tty);
 }
 
-// Print usage information and exit
+// Print usage information
 void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-s file.csv] [-f freq] [-h]\n"
+            "Usage: %s [-s file.csv] [-f freq] [-p /dev/ttyXXX] [-h]\n"
             "  -s file.csv   Save output to CSV file\n"
             "  -f freq       Sampling frequency (200–1600 Hz)\n"
+            "  -p PORT       Serial port (default: /dev/ttyACM0)\n"
             "  -h            Show this help message\n",
             prog);
     exit(1);
 }
-
 // Main function
 int main(int argc, char *argv[])
 {
     const char *save_path = NULL;
+    const char *port_path = DEFAULT_SERIAL_PORT;
     int freq = 0;
 
-    // Parse arguments
+    // Parse command-line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "hs:f:")) != -1)
+    while ((opt = getopt(argc, argv, "hs:f:p:")) != -1)
     {
         switch (opt)
         {
-        case 's':  // Save path for CSV output
+        case 's': // Save path for CSV output
             save_path = optarg;
             break;
-        case 'f':  // Frequency in Hz
+        case 'f': // Frequency in Hz
             freq = atoi(optarg);
             break;
-        case 'h':  // Help  
+        case 'p': // Serial port path
+            port_path = optarg;
+            break;
+        case 'h': // Help
         default:
             usage(argv[0]);
         }
     }
 
-    // Validate frequency
+    // Validate frequency if given
     if (freq != 0 && (freq < 200 || freq > 1600))
     {
         fprintf(stderr, "Frequency must be between 200 and 1600 Hz\n");
         return 1;
     }
 
-    // Setup signal handler
+    // Set up signal handler for Ctrl+C
     signal(SIGINT, handle_sigint);
 
-    // Raw mode for instant 'Q' detection
+    // Enable raw mode on stdin to detect 'Q' without Enter
     struct termios orig_termios, raw_termios;
     tcgetattr(STDIN_FILENO, &orig_termios);
     raw_termios = orig_termios;
     raw_termios.c_lflag &= ~(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &raw_termios);
 
-    // Open and configure serial
-    int fd = open(SERIAL_PORT, O_RDWR | O_NOCTTY);
-    if (fd < 0) { perror("open serial"); return 2; }
-    if (configure_serial(fd) != 0) { perror("configure serial"); close(fd); return 3; }
-    FILE *serial = fdopen(fd, "r+");
-    if (!serial) { perror("fdopen"); close(fd); return 4; }
+    // Open and configure the serial port
+    int fd = open(port_path, O_RDWR | O_NOCTTY);
+    if (fd < 0)
+    {
+        fprintf(stderr, "Failed to open port %s: %s\n", port_path, strerror(errno));
+        return 2;
+    }
+    if (configure_serial(fd) != 0)
+    {
+        perror("configure serial");
+        close(fd);
+        return 3;
+    }
 
-    // Flush input and send frequency command
+    FILE *serial = fdopen(fd, "r+");
+    if (!serial)
+    {
+        perror("fdopen");
+        close(fd);
+        return 4;
+    }
+
+    // Flush any input and send the frequency command if needed
     tcflush(fd, TCIFLUSH);
     usleep(100000);
     if (freq > 0)
@@ -110,7 +127,7 @@ int main(int argc, char *argv[])
         fflush(serial);
     }
 
-    // Wait for "time,x,y,z" header
+    // Wait for the header line "time,x,y,z"
     char line[LINE_BUF_SIZE];
     int line_pos = 0, got_header = 0;
 
@@ -168,7 +185,7 @@ int main(int argc, char *argv[])
     struct timeval start, end;
     gettimeofday(&start, NULL);
 
-    // Set stdin non-blocking
+    // Make stdin non-blocking
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
     while (running)
@@ -178,7 +195,7 @@ int main(int argc, char *argv[])
         if (read(STDIN_FILENO, &c, 1) == 1 && (c == 'q' || c == 'Q'))
             break;
 
-        // Read line from serial
+        // Read line from serial    
         if (!fgets(line, sizeof(line), serial))
             continue;
 
@@ -186,16 +203,14 @@ int main(int argc, char *argv[])
         // Parse the line for x, y, z values
         if (sscanf(line, "%d,%d,%d", &xi, &yi, &zi) == 3)
         {
-            // Convert to float and scale G
             float xf = xi * 0.001f;
             float yf = yi * 0.001f;
             float zf = zi * 0.001f;
 
-             // Calculate elapsed time
+            // Calculate elapsed time
             struct timeval now;
             gettimeofday(&now, NULL);
             double elapsed_sample = (now.tv_sec - start.tv_sec) + (now.tv_usec - start.tv_usec) / 1e6;
-
 
             // Print to CSV or stdout
             if (csv)
@@ -207,7 +222,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Stop and clean up
+    // Send stop command and clean up
     fprintf(serial, "Q\r\n");
     fflush(serial);
 

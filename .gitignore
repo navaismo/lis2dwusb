@@ -5,3 +5,4 @@ test
 lis2dwusb
 tests/__pycache__/
 *.pyc
+*.zip

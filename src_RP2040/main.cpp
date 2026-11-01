@@ -1,20 +1,8 @@
 #include <Arduino.h>
-#include <SPI.h>
 #include "mbed.h"
-
-/* ---------------LIS2DW12 ---------------------------- */
-#define WHO_AM_I_ADDR 0x0F
-#define CTRL_REG1_ADDR 0x20
-#define CTRL_REG2_ADDR 0x21
-#define CTRL_REG6_ADDR 0x25
-#define STATUS_REG_ADDR 0x27
-#define OUT_XL_ADDR 0x28
-#define OUT_XH_ADDR 0x29
-#define OUT_YL_ADDR 0x2A
-#define OUT_YH_ADDR 0x2B
-#define OUT_ZL_ADDR 0x2C
-#define OUT_ZH_ADDR 0x2D
-#define REG_MOD_READ 0x80
+#include <USB/PluggableUSBSerial.h>
+#include <inttypes.h>
+#include "lis2dw_protocol.h"
 
 #ifndef CS_PIN
 #define CS_PIN 9
@@ -29,319 +17,220 @@
 #define MISO_PIN 8
 #endif
 
-String fw = "LIS2DW USB accelerometer FW v0.2.2 \r\nhttps://github.com/lis2dwusb\r\nby @navaismo";
-
-// Variable to store the sample interval in microseconds
-// If sample_us == 0, it means that we should not read the sensor
-// If sample_us > 0, it means that we should read the sensor at this interval
-// (e.g., 1000 means 1 ms, 50000 means 50 ms, etc.)
-volatile uint32_t sample_us = 0;
-uint32_t t0_us = 0;
-uint32_t next_us = 0;
-uint8_t fs_setting = 0; // Full-scale setting read from CTRL_REG6
-float lsb_per_g = 16384.0f; // We always set the scale at ±2g, so this is the LSB per G value
-
-// Struct to hold axis readings
-// Each axis is represented by two bytes: LSB and MSB
-// The value is stored as a signed 16-bit integer
-union AxisReading
-{
-    struct
-    {
-        uint8_t low, high;
-    };
-    int16_t value;
+namespace {
+constexpr uint8_t WHO_AM_I = 0x0F, CTRL1 = 0x20, CTRL2 = 0x21, CTRL6 = 0x25;
+constexpr uint8_t OUT_X_L = 0x28, FIFO_CTRL = 0x2E, FIFO_SAMPLES = 0x2F;
+constexpr size_t QUEUE_SIZE = 256;
+mbed::SPI spi(digitalPinToPinName(MOSI_PIN), digitalPinToPinName(MISO_PIN), digitalPinToPinName(SCK_PIN));
+struct Sample {
+    uint32_t sequence;
+    uint64_t time;
+    int16_t axes[3];
+    uint32_t window;
 };
+Sample samples[QUEUE_SIZE];
+size_t head = 0, tail = 0, queued = 0;
+uint32_t sequence = 0, rate = 0, last_tick = 0;
+uint64_t clock_us = 0, epoch = 0, last_empty = 0, last_sample = 0, last_tx = 0;
+bool active = false, finishing = false;
+unsigned discard = 0;
+char token[9] = "00000000";
+char input[LIS_LINE_SIZE], pending[LIS_LINE_SIZE], control[LIS_LINE_SIZE];
+size_t input_size = 0, pending_size = 0, pending_offset = 0;
 
-static mbed::SPI spiPort(
-    digitalPinToPinName(MOSI_PIN),
-    digitalPinToPinName(MISO_PIN),
-    digitalPinToPinName(SCK_PIN));
-// SPI speed in Hz
-// The LIS2DW12 supports up to 10 MHz, but we use 5 MHz for stability
-// (as per the datasheet, it is recommended to use a lower speed for reliable communication)
-constexpr uint32_t SPI_SPEED = 10'000'000;
-
-// Buffer to accumulate command line
-String cmd = "";
-
-// Helpers SPI /CS
-inline void csLow() { digitalWrite(CS_PIN, LOW); }
-inline void csHigh() { digitalWrite(CS_PIN, HIGH); }
-
-// Write a byte to the LIS2DW sensor
-void lisWrite(uint8_t reg, uint8_t val)
-{
-    csLow();
-    spiPort.write(reg & 0x3F);
-    spiPort.write(val);
-    csHigh();
+uint64_t nowUs() {
+    const uint32_t tick = micros();
+    clock_us += uint32_t(tick - last_tick);
+    last_tick = tick;
+    return clock_us;
 }
-// Read a byte from the LIS2DW sensor
-uint8_t lisReadReg(uint8_t reg)
-{
-    csLow();
-    spiPort.write(REG_MOD_READ | (reg & 0x3F));
-    uint8_t v = spiPort.write(0);
-    csHigh();
-    return v;
+void writeReg(uint8_t address, uint8_t value) {
+    digitalWrite(CS_PIN, LOW);
+    spi.write(address & 0x7F);
+    spi.write(value);
+    digitalWrite(CS_PIN, HIGH);
 }
-
-// Reinitialize the sensor with a new frequency
-// This function is called when the user sends a command to change the frequency
-void reinitSensor(uint32_t f_hz)
-{
-     // Soft reset
-    lisWrite(CTRL_REG2_ADDR, 0x40);
-    delay(30);
-    while (lisReadReg(CTRL_REG2_ADDR) & 0x40);
-
-    // CTRL_REG2
-    // BDU = 0 (block data continuos update), bit3 of CTRL_REG2, 
-    // IF_ADDR_INC = 1 for auto-increment bit2 of CTRL_REG2
-    lisWrite(CTRL_REG2_ADDR, 0x04);
-
-
-    // CTRL_REG6
-    // Bandwith (bit6,bit7) = 00 ODR/2 800 - 1600 Hz
-    // Fullscale ±2g (bit5-bit4) = 00
-    // Filtered data (bit3) = 0 - Low-pass filter enabled
-    // Low_noise (bit2) = 0  - Disabled
-    // bit1 = 0 (not used)
-    // bit0 = 0 (not used) 
-    lisWrite(CTRL_REG6_ADDR, 0x00);
-
-
-    // Ctrl_reg1: We choose the full value according to frequency
-    uint8_t ctrl1_val;
-    String fq = "0"; // Frequency in Hz, used for Serial print
-    if (f_hz >= 1500){ //1600 Hz
-        // CTRL_REG1
-        // ODR (bit7-bit4) = 1001  - 1600 Hz
-        // MODE(bit3-bit2) = 01    - High-performance mode
-        // LP_MODE(bit1-bit0) = 11 - Low-power mode 4, 14 bit resolution
-        ctrl1_val = 0x97;
-        fq = "1600"; 
-    }else if (f_hz >= 700){ // 800 Hz
-        // CTRL_REG1
-        // ODR (bit7-bit4) = 1000  - 800 Hz
-        // MODE(bit3-bit2) = 01    - High-performance mode
-        // LP_MODE(bit1-bit0) = 11 - Low-power mode 4, 14 bit resolution
-        ctrl1_val = 0x87;
-        fq = "800"; 
-    }else if (f_hz >= 350){ // 400 Hz
-        // CTRL_REG1
-        // ODR (bit7-bit4) = 0111  - 400 Hz
-        // MODE(bit3-bit2) = 01    - High-performance mode
-        // LP_MODE(bit1-bit0) = 11 - Low-power mode 4, 14 bit resolution
-        ctrl1_val = 0x77;
-        fq = "400"; 
-    }else if (f_hz >= 150){ // 200 Hz
-        // CTRL_REG1
-        // ODR (bit7-bit4) = 0110  - 200 Hz
-        // MODE(bit3-bit2) = 01    - High-performance mode
-        // LP_MODE(bit1-bit0) = 11 - Low-power mode 4, 14 bit resolution
-        ctrl1_val = 0x67;
-        fq = "200"; 
-    }else{
-        ctrl1_val = 0x97; // 1600 Hz
-        fq = "1600"; // Default to 1600 Hz if frequency is too low
+uint8_t readReg(uint8_t address) {
+    digitalWrite(CS_PIN, LOW);
+    spi.write(address | 0x80);
+    const uint8_t value = spi.write(0);
+    digitalWrite(CS_PIN, HIGH);
+    return value;
+}
+void readAxes(int16_t *axes) {
+    digitalWrite(CS_PIN, LOW);
+    spi.write(OUT_X_L | 0x80);
+    for (unsigned axis = 0; axis < 3; ++axis) {
+        const uint8_t low = spi.write(0), high = spi.write(0);
+        axes[axis] = int16_t(uint16_t(low) | (uint16_t(high) << 8));
     }
-    // Set ODR and enable the sensor
-    lisWrite(CTRL_REG1_ADDR, ctrl1_val);
-
-    // Restart our t0_us
-    t0_us = micros();
-    next_us = t0_us;
-
-    // Print the reinitialization information
-    Serial.println("Rebooting to setup new Freq: " + fq + " Hz");
-    Serial.println(fw);
-    Serial.print("WHO_AM_I: 0x");
-    Serial.println(lisReadReg(WHO_AM_I_ADDR), HEX);
-    Serial.print("CTRL_REG1: 0x");
-    Serial.println(lisReadReg(CTRL_REG1_ADDR), HEX);
-    Serial.print("CTRL_REG2: 0x");
-    Serial.println(lisReadReg(CTRL_REG2_ADDR), HEX);
-    Serial.print("CTRL_REG6: 0x");
-    fs_setting = lisReadReg(CTRL_REG6_ADDR);
-    Serial.println(fs_setting, HEX);
+    digitalWrite(CS_PIN, HIGH);
 }
+void powerDown() {
+    active = false;
+    writeReg(CTRL1, 0);
+    writeReg(FIFO_CTRL, 0);
+}
+void fail(const char *reason) {
+    powerDown();
+    finishing = false;
+    queued = head = tail = 0;
+    snprintf(control, sizeof(control), "ERROR,%s,%s", token, reason);
+}
+bool configure(unsigned requested) {
+    if (readReg(WHO_AM_I) != 0x44) return false;
+    writeReg(CTRL2, 0x40);
+    const uint64_t deadline = nowUs() + 100000;
+    while (readReg(CTRL2) & 0x40) {
+        if (nowUs() >= deadline) return false;
+        delay(1);
+    }
+    // ST DS11811: BDU + address increment, high-performance mode, +/-2 g.
+    writeReg(CTRL2, 0x0C);
+    writeReg(CTRL6, 0x00);
+    const uint8_t odr = requested == 1600 ? 0x94 : requested == 800 ? 0x84 : requested == 400 ? 0x74 : 0x64;
+    writeReg(CTRL1, odr);
+    if (readReg(CTRL1) != odr || readReg(CTRL2) != 0x0C || readReg(CTRL6) != 0) return false;
+    delay(30);
+    writeReg(FIFO_CTRL, 0);
+    writeReg(FIFO_CTRL, 0xC0);
+    if (readReg(FIFO_CTRL) != 0xC0) return false;
+    discard = 2;  // Covers ODR stabilization and the FIFO-switch discard.
+    return true;
+}
+void command(char *line) {
+    if (!lis_unframe(line)) { fail("BAD_COMMAND_CRC"); return; }
+    char *save = nullptr;
+    char *verb = strtok_r(line, ",", &save);
+    char *argument = strtok_r(nullptr, ",", &save);
+    char *third = strtok_r(nullptr, ",", &save);
+    if (verb && !strcmp(verb, "HELLO") && argument && lis_token_valid(argument) && !third) {
+        powerDown();
+        queued = head = tail = 0;
+        finishing = false;
+        strcpy(token, argument);
+        snprintf(control, sizeof(control), "LIS2DWUSB,2,%s", token);
+        return;
+    }
+    if (verb && !strcmp(verb, "START") && argument && third && !strcmp(third, token)
+            && !strtok_r(nullptr, ",", &save) && !active && !finishing && !queued && !control[0]) {
+        char *end = nullptr;
+        const unsigned long requested = strtoul(argument, &end, 10);
+        if (!argument[0] || *end || requested > 1600 || !lis_rate_valid(unsigned(requested))) {
+            fail("UNSUPPORTED_RATE"); return;
+        }
+        if (!configure(unsigned(requested))) { fail("SENSOR_CONFIG"); return; }
+        rate = unsigned(requested);
+        sequence = 0;
+        epoch = last_empty = last_sample = last_tx = nowUs();
+        active = true;
+        snprintf(control, sizeof(control), "READY,2,%s,%u,16384,POLL", token, unsigned(rate));
+        return;
+    }
+    if (verb && !strcmp(verb, "STOP") && argument && !strcmp(argument, token) && !third && active) {
+        powerDown();
+        finishing = true;
+        return;
+    }
+    fail("BAD_COMMAND");
+}
+void receiveCommands() {
+    // Bound command work so a noisy host cannot starve acquisition.
+    for (unsigned i = 0; i < 32 && _SerialUSB.available(); ++i) {
+        const int value = _SerialUSB.read();
+        if (value == '\r') continue;
+        if (value == '\n') {
+            input[input_size] = 0;
+            command(input);
+            input_size = 0;
+        } else if (value < 32 || value > 126 || input_size == sizeof(input) - 1) {
+            input_size = 0;
+            fail("BAD_COMMAND_LENGTH");
+        } else input[input_size++] = char(value);
+    }
+}
+void acquire() {
+    if (!active) return;
+    const uint64_t before = nowUs();
+    const uint8_t status = readReg(FIFO_SAMPLES);
+    const uint64_t observed = nowUs();
+    if (status & 0x40) { fail("FIFO_OVERFLOW"); return; }
+    const unsigned count = status & 0x3F;
+    if (!count) {
+        last_empty = before;
+        if (observed - last_sample > 500000) fail("SENSOR_TIMEOUT");
+        return;
+    }
+    // A backlog has no individually observed edges: never invent its times.
+    if (count != 1) { fail("TIMING_BACKLOG"); return; }
+    int16_t axes[3];
+    readAxes(axes);
+    last_sample = observed;
+    if (discard) { --discard; last_empty = nowUs(); return; }
+    const uint64_t window = observed - last_empty;
+    if (window > 1000000UL / rate / 4) { fail("TIMING_UNCERTAIN"); return; }
+    if (queued == QUEUE_SIZE || sequence == UINT32_MAX) { fail("BUFFER_OVERFLOW"); return; }
+    for (unsigned axis = 0; axis < 3; ++axis)
+        if (axes[axis] >= 32760 || axes[axis] <= -32760) { fail("CLIPPING"); return; }
+    Sample &sample = samples[head];
+    sample.sequence = sequence++;
+    sample.time = last_empty + window / 2 - epoch;
+    memcpy(sample.axes, axes, sizeof(axes));
+    sample.window = uint32_t(window);
+    head = (head + 1) % QUEUE_SIZE;
+    ++queued;
+}
+void transmit() {
+    if (pending_offset == pending_size) {
+        pending_offset = pending_size = 0;
+        char payload[LIS_LINE_SIZE] = {};
+        if (control[0]) {
+            strcpy(payload, control);
+            control[0] = 0;
+        } else if (queued) {
+            const Sample &s = samples[tail];
+            snprintf(payload, sizeof(payload), "S,%" PRIu32 ",%" PRIu64 ",%d,%d,%d,%" PRIu32,
+                     s.sequence, s.time, int(s.axes[0]), int(s.axes[1]), int(s.axes[2]), s.window);
+            tail = (tail + 1) % QUEUE_SIZE;
+            --queued;
+        } else if (finishing) {
+            snprintf(payload, sizeof(payload), "DONE,%s,%" PRIu32, token, sequence);
+            finishing = false;
+        }
+        if (!payload[0]) return;
+        const int size = lis_frame(pending, sizeof(pending), payload);
+        if (size < 0) { fail("FRAME_SIZE"); return; }
+        pending_size = size_t(size);
+    }
+    uint32_t sent = 0;
+    // Ordinary Serial.write blocks; the pinned mbed CDC API does not.
+    _SerialUSB.send_nb(reinterpret_cast<uint8_t *>(pending + pending_offset),
+                   uint32_t(pending_size - pending_offset), &sent);
+    pending_offset += sent;
+    if (sent) last_tx = nowUs();
+    if (active && nowUs() - last_tx > 2000000) fail("USB_TIMEOUT");
+}
+}  // namespace
 
-// Setup LIS2DW sensor
-void setupLIS2DW()
-{
+void setup() {
     pinMode(CS_PIN, OUTPUT);
-    csHigh();
-    spiPort.frequency(SPI_SPEED);
-    spiPort.format(8, 0);
-
-    // Soft reset
-    lisWrite(CTRL_REG2_ADDR, 0x40);
-    delay(30);
-    while (lisReadReg(CTRL_REG2_ADDR) & 0x40);
-
-    // BDU = 0 (block data continuos update), bit3 of CTRL_REG2, 
-    // IF_ADDR_INC = 1 for auto-increment bit2 of CTRL_REG2
-    lisWrite(CTRL_REG2_ADDR, 0x04);
-
-    // CTRL_REG6
-    // Bandwith (bit6,bit7) = 00 ODR/2 800 - 1600 Hz
-    // Fullscale ±2g (bit5-bit4) = 00
-    // Filtered data (bit3) = 0 - Low-pass filter enabled
-    // Low_noise (bit2) = 0  - Disabled
-    // bit1 = 0 (not used)
-    // bit0 = 0 (not used) 
-    lisWrite(CTRL_REG6_ADDR, 0x00);
-
-    // CTRL_REG1
-    // ODR (bit7-bit4) = 1001  - 1600 Hz
-    // MODE(bit3-bit2) = 01    - High-performance mode
-    // LP_MODE(bit1-bit0) = 11 - Low-power mode 4, 14 bit resolution
-    lisWrite(CTRL_REG1_ADDR, 0x97);
-
-    // Save times if you use them ...
-    t0_us = micros();
-    next_us = t0_us;
+    digitalWrite(CS_PIN, HIGH);
+    spi.frequency(5000000);
+    spi.format(8, 0);
+    _SerialUSB.begin(2000000);
+    last_tick = micros();
 }
-
-
-void setup()
-{
-    Serial.begin(2000000);
-    while (!Serial)
-    {
+void loop() {
+    nowUs();
+    if (!_SerialUSB.connected()) {
+        if (active || finishing) powerDown();
+        finishing = false;
+        queued = head = tail = 0;
+        pending_size = pending_offset = input_size = 0;
+        control[0] = 0;
+        return;
     }
-
-    setupLIS2DW();
-
-    // Print banner, but we don't print data or header yet:
-    Serial.println(fw);
-    Serial.print("WHO_AM_I: 0x");
-    Serial.println(lisReadReg(WHO_AM_I_ADDR), HEX);
-    Serial.print("CTRL_REG1: 0x");
-    Serial.println(lisReadReg(CTRL_REG1_ADDR), HEX);
-    Serial.print("CTRL_REG2: 0x");
-    Serial.println(lisReadReg(CTRL_REG2_ADDR), HEX);
-    Serial.print("CTRL_REG6: 0x");
-    fs_setting = lisReadReg(CTRL_REG6_ADDR);
-    Serial.println(fs_setting, HEX);
-}
-
-// Check if new data is ready
-bool dataReady()
-{
-    // If DRDY bit (bit0) of STATUS_REG is set, it means that new data is ready
-    return (lisReadReg(STATUS_REG_ADDR) & 0x01) != 0;
-}
-
-// Read axes X, Y, Z in burst mode
-// This function reads all three axes in one burst read operation
-// It is more efficient than reading each axis separately
-void burstReadAxes(AxisReading &x, AxisReading &y, AxisReading &z)
-{
-    // Wait for fresh data
-    while (!dataReady());
-
-    uint8_t buf[6];
-    csLow();
-    // Send the read command for OUT_XL_ADDR
-    spiPort.write(0x80 | OUT_XL_ADDR); // READ  | OUT_X_L
-    // Read 6 bytes(REG ADDRs) in burst mode
-    for (int i = 0; i < 6; i++)
-        buf[i] = spiPort.write(0);
-    
-
-    csHigh();
-    // Assign the values to the AxisReading structures
-    x.low = buf[0];
-    x.high = buf[1];
-    y.low = buf[2];
-    y.high = buf[3];
-    z.low = buf[4];
-    z.high = buf[5];
-}
-
-uint32_t samples = 0;
-// Main loop
-void loop()
-{
-    // Process serial bytes (to assemble CMD complete)
-    while (Serial.available())
-    {
-        char c = Serial.read();
-        if (c == '\r')
-            continue;
-        if (c == '\n')
-        {
-            // End of line arrived → We process CMD:
-            cmd.trim();
-            cmd.toUpperCase();
-            if (cmd.startsWith("F="))
-            {
-                // It is "F = <n>"
-                uint32_t f = cmd.substring(2).toInt();
-                if (f < 200) // Minimum frequency is 200 Hz
-                    f = 200;
-                if (f > 2000) // Maximum frequency is 2000 Hz
-                    f = 2000;
-
-                // Calculate interval in µs and reconfigure ODR
-                sample_us = 1'000'000UL / f;
-                reinitSensor(f);
-
-                // Send the header to confirm:
-                Serial.println("time,x,y,z");
-            }
-            else if (cmd == "Q")
-            {
-                // If "Q" arrives, we stop the transmission completely
-                sample_us = 0; // Indicates "do not send" to another f =
-                // (If I want, I can print something like "Stopped \ n")
-                // Serial.println ("stopped");
-            }
-            cmd = "";
-        }
-        else
-        {
-            cmd += c;
-        }
-    }
-
-    // If sample_us == 0, it means that we should not read the sensor or the Register DRDY has not data ready
-    if (sample_us == 0 || !dataReady()) return;
-    
-        // Read Axes X, Y, Z.
-        // AxisReading x, y, z;
-
-        // x.low  = lisReadReg(OUT_XL_ADDR);
-        // x.high = lisReadReg(OUT_XH_ADDR);
-        // y.low  = lisReadReg(OUT_YL_ADDR);
-        // y.high = lisReadReg(OUT_YH_ADDR);
-        // z.low  = lisReadReg(OUT_ZL_ADDR);
-        // z.high = lisReadReg(OUT_ZH_ADDR);
-
-        AxisReading x, y, z;
-        burstReadAxes(x, y, z);
-
-        // Convert raw values to mg (milligravity)
-        int16_t xi = (int16_t)(x.value * 1000 / lsb_per_g);
-        int16_t yi = (int16_t)(y.value * 1000 / lsb_per_g);
-        int16_t zi = (int16_t)(z.value * 1000 / lsb_per_g);
-
-
-        char buf[48];
-        // Send the data in CSV format
-        snprintf(buf, sizeof(buf), "%d,%d,%d", xi, yi, zi);
-        Serial.print(buf);
-        Serial.print("\r\n");
-
-        // samples++;
-        // if(millis() % 1000 == 0) {
-        //    Serial.print("Samples: ");
-        //    Serial.println(samples);
-        // }
-
-
-    //}
+    acquire();
+    receiveCommands();
+    transmit();
 }

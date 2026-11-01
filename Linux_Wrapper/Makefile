@@ -1,17 +1,17 @@
-CC = gcc
-CFLAGS = -Wall -pthread
-LIBS = -L /usr/local/include -lpigpio -lrt
-INSTALL = `which install`
+CC ?= cc
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -Werror
+PREFIX ?= /usr/local
+DESTDIR ?=
 
-all: packages lis2dwusb
+.PHONY: all install clean
+all: lis2dwusb
+
+lis2dwusb: lis2dwusb.c ../include/lis2dw_protocol.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $@
 
 install: lis2dwusb
-	$(INSTALL) ./lis2dwusb /usr/local/bin/lis2dwusb
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 lis2dwusb $(DESTDIR)$(PREFIX)/bin/lis2dwusb
 
 clean:
-	rm -f lis2dwusb
-
-packages:
-
-lis2dwusb: lis2dwusb.c
-	$(CC) $(CFLAGS) lis2dwusb.c $(LIBS) -o lis2dwusb
+	$(RM) lis2dwusb

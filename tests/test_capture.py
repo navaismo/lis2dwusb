@@ -128,7 +128,8 @@ def test_stalled_sensor_times_out_without_a_stop_key(binary, tmp_path):
         device.close()
 
 
-def test_real_plugin_capture_and_analyzer_accept_precise_wrapper_output(binary, tmp_path):
+@pytest.mark.parametrize('rate', [800, 1600])
+def test_real_plugin_capture_and_analyzer_accept_precise_wrapper_output(binary, tmp_path, rate):
     root = os.environ.get('PINPUT_PLUGIN_ROOT')
     if not root:
         pytest.skip('Set PINPUT_PLUGIN_ROOT to exercise the matching OctoPrint plugin')
@@ -136,8 +137,8 @@ def test_real_plugin_capture_and_analyzer_accept_precise_wrapper_output(binary, 
     from octoprint_Pinput_Shaping.capture import AccelerometerCapture
     from octoprint_Pinput_Shaping.inputshaping_analyzer import InputShapingAnalyzer
     path = tmp_path / 'capture.csv'
-    device = Device(binary, path, count=4096)
-    capture = AccelerometerCapture('lis2dw', path)
+    device = Device(binary, path, rate=rate, count=4096)
+    capture = AccelerometerCapture('lis2dw', path, lis2dw_rate=rate)
     capture.driver, capture.port = str(binary), device.port
     device.thread.start()
     try:
@@ -150,7 +151,7 @@ def test_real_plugin_capture_and_analyzer_accept_precise_wrapper_output(binary, 
         analyzer.analyze()
         assert abs(analyzer.base_freq - 50) < 1
         assert analyzer.quality['timestamp_jitter'] < 0.001
-        assert analyzer.sampling_rate == pytest.approx(1600)
+        assert analyzer.sampling_rate == pytest.approx(rate)
     finally:
         capture.abort()
         device.close()

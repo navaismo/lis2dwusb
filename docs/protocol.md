@@ -74,17 +74,24 @@ in measured timestamps, not removed by scaling them to the requested rate.
 ## Buffering and stop
 
 A fixed queue holds 256 accepted samples, with one additional sample held by the
-serializer. Each bounded serializer step formats at most one numeric field,
-computes CRC over at most eight payload bytes, copies a frame suffix to the USB
-packet buffer, or attempts one nonblocking USB write. The main loop processes
-up to eight steps, polling the FIFO before every step. Active captures consume
+serializer. Each bounded serializer step formats at most one numeric field
+directly into its frame, computes CRC over at most 32 payload bytes, or copies a
+frame suffix into a separate 512-byte transmit ring. USB packet preparation and
+nonblocking writes are serviced independently after every two serializer steps.
+The main loop processes up to eight serializer steps, polling the FIFO before
+every serializer or USB operation. Active captures consume
 at most four command bytes per loop. FIFO status and XYZ are read with one
 buffered SPI transaction each, avoiding a separate driver call per byte. The
 timing acceptance limit is unchanged and still needs physical validation.
 
-A 64-byte staging buffer combines ASCII frames into full USB CDC packets. Frame
+A 64-byte staging buffer draws from the transmit ring to submit full CDC packets.
+Serialization can continue while that packet waits for the endpoint; the old
+single staging buffer stopped both tasks whenever USB was busy. A busy endpoint
+is retried after at least 50 us while acquisition and serialization continue.
+The sample queue remains 256 entries; neither buffer can compensate for a host
+whose sustained throughput is below the stream's required bandwidth. Frame
 boundaries and CRCs are independent of USB packet boundaries. Partly filled
-packets flush after 1 ms, or promptly after a control response, including DONE.
+packets flush after 2 ms, or promptly at a control response, including DONE.
 Control responses always terminate in a short packet, including when adding a
 CR before LF is necessary to avoid an exact 64-byte boundary.
 The sender preserves partial writes and finishes a partly transmitted frame
@@ -98,7 +105,7 @@ details in its reason field. `work` identifies the most recent format, CRC, USB
 or command step; it helps locate delays but does not measure their individual
 execution times. The wrapper reports these details and rejects the capture.
 `BUFFER_OVERFLOW` includes `acq` (accepted samples), `fmt` (sample frames copied
-to the USB staging buffer), `usb_ok` (successful nonblocking write calls) and
+to the transmit ring), `usb_ok` (successful nonblocking write calls) and
 `usb_busy` (write calls that accepted zero bytes). These counters help separate
 serialization pressure from USB backpressure; they do not establish capture
 validity or the number of samples received by the host.
@@ -128,3 +135,10 @@ Physical acquisition behavior, operating-system latency and repeatability
 remain unvalidated. The source tests and pseudo-terminal tests verify software
 contracts and deliberate failure responses. Existing binaries and the plugin's
 legacy installer pin remain unchanged until a reviewed release is authorized.
+
+The combined synthetic SPI/formatting workload and 1 ms bulk-endpoint delay
+reproduced inadequate 1600 Hz throughput with the previous transmitter. The
+revised path completes 15 seconds at all four rates in that simulation, with
+contiguous sample sequences, CRC checks, accepted timing windows and matching
+DONE counts. These workload costs are a test model, not measured target costs;
+physical 1600 Hz stability still requires testing with the actual USB host.

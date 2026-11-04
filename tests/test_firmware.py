@@ -90,15 +90,18 @@ def test_abort_preserves_line_boundaries_during_staged_transmission(firmware, sc
 
 
 def test_actual_firmware_powers_down_on_usb_disconnect(firmware):
-    records = frames(firmware, 'disconnect')
-    assert not any(record[0] == 'DONE' for record in records)
+    # A physical disconnect may truncate the packet currently in flight.
+    # The harness verifies power-down; no completion may be advertised.
+    result = subprocess.run([firmware, 'disconnect'], capture_output=True, check=True)
+    assert b'DONE,' not in result.stdout
 
 
 @pytest.mark.parametrize('rate', [200, 400, 800, 1600])
-def test_full_packet_streaming_survives_spi_cost_and_short_packet_delays(firmware, rate):
-    records = frames(firmware, 'throughput', rate)
+@pytest.mark.parametrize('scenario', ['throughput', 'bulk_latency'])
+def test_full_packet_streaming_survives_spi_cost_and_short_packet_delays(firmware, rate, scenario):
+    records = frames(firmware, scenario, rate)
     samples = [record for record in records if record[0] == 'S']
-    assert len(samples) >= rate * 10
+    assert len(samples) >= rate * 15
     assert [int(record[1]) for record in samples] == list(range(len(samples)))
     assert records[-1] == ['DONE', '1234abcd', str(len(samples))]
     assert not any(record[0] == 'ERROR' for record in records)

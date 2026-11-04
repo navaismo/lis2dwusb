@@ -104,7 +104,7 @@ still may be too short or too quiet for input-shaping analysis.
 ## OctoPrint compatibility
 
 The matching `OctoPrint-Pinput_Shaping` optimization branch already uses
-`-p PORT -f 1600 -s FILE`, waits for `Press Q to stop`, checks CSV progress and
+`-p PORT -f RATE -s FILE`, waits for `Press Q to stop`, checks CSV progress and
 requires successful process exit after Q. Those interfaces are preserved.
 The wrapper exports acquisition timing instead of host receipt timing, so the
 plugin can validate and analyze it without relaxing its quality gates.

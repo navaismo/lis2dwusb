@@ -50,11 +50,12 @@ void runFor(uint64_t duration) {
 }
 void drain() {
     const uint64_t deadline = fake_time + 2000000;
-    while ((queued || finishing || control[0] || tx_state != TxState::IDLE || usb_size) && fake_time < deadline) {
+    while ((queued || finishing || control[0] || tx_state != TxState::IDLE || usb_size || tx_queued) && fake_time < deadline) {
         transmit();
+        serviceUSB();
         fake_time += 20;
     }
-    assert(!queued && !finishing && !control[0] && tx_state == TxState::IDLE && !usb_size);
+    assert(!queued && !finishing && !control[0] && tx_state == TxState::IDLE && !usb_size && !tx_queued);
 }
 void feed(const char *payload) {
     char encoded[LIS_LINE_SIZE];
@@ -72,8 +73,9 @@ int main(int argc, char **argv) {
     if (scenario == "control_boundary") {
         for (size_t padding = 0; padding < USB_PACKET_SIZE; ++padding) {
             // CR padding is ignored by the line reader and selects each alignment.
-            memset(usb_packet, '\r', padding);
-            usb_size = padding;
+            memset(tx_bytes, '\r', padding);
+            tx_head = tx_queued = padding;
+            tx_tail = 0;
             usb_started = nowUs();
             strcpy(control, "LIS2DWUSB,2,1234abcd");
             drain();
@@ -106,8 +108,9 @@ int main(int argc, char **argv) {
         do { transmit(); } while (tx_state != target);
         if (scenario == "abort_send" || scenario == "abort_usb" || scenario == "abort_packet") transmit();
         if (scenario == "abort_usb" || scenario == "abort_packet") {
-            usb_flush = true;
-            transmit();
+            tx_flush = tx_queued;
+            serviceUSB();
+            serviceUSB();
             assert(usb_offset == 5);
         }
         fail("TEST_ABORT");
@@ -115,11 +118,11 @@ int main(int argc, char **argv) {
         std::cout << _SerialUSB.output;
         return 0;
     }
-    synthetic_workload = scenario == "workload";
-    if (scenario == "throughput") {
+    synthetic_workload = scenario == "workload" || scenario == "bulk_latency";
+    if (scenario == "throughput" || scenario == "bulk_latency") {
         spi_call_cost_us = 15;
         // A synthetic host delays short packets more than full bulk packets.
-        _SerialUSB.packet_delay_us = 100;
+        _SerialUSB.packet_delay_us = scenario == "bulk_latency" ? 1000 : 100;
         _SerialUSB.short_packet_delay_us = 1000;
     }
     feed("HELLO,1234abcd");
@@ -143,18 +146,18 @@ int main(int argc, char **argv) {
         _SerialUSB.online = false;
         runFor(1000);
         assert(!active && registers[0x20] == 0);
-    } else if (scenario == "normal" || scenario == "wrap" || scenario == "workload" || scenario == "throughput") {
-        _SerialUSB.write_limit = synthetic_workload || scenario == "throughput" ? 64 : 5;
-        runFor(scenario == "throughput" ? 10000000 : 2600000);
+    } else if (scenario == "normal" || scenario == "wrap" || scenario == "workload" || scenario == "throughput" || scenario == "bulk_latency") {
+        _SerialUSB.write_limit = synthetic_workload || scenario == "throughput" || scenario == "bulk_latency" ? 64 : 5;
+        runFor(scenario == "throughput" || scenario == "bulk_latency" ? 15000000 : 2600000);
         feed("STOP,1234abcd");
     }
     runFor(20000);
     assert(!active);
-    if (scenario == "throughput") {
-        assert(sequence >= requested * 9);
+    if (scenario == "throughput" || scenario == "bulk_latency") {
+        assert(sequence >= requested * 14);
         if (requested == 1600) {
             assert(_SerialUSB.full_packets > _SerialUSB.short_packets);
-            assert(_SerialUSB.busy_writes > 0);
+            if (scenario == "bulk_latency") assert(_SerialUSB.busy_writes > 0);
         }
     }
     drain();

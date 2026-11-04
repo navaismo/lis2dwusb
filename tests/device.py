@@ -59,6 +59,8 @@ class Device:
         return None
 
     def write(self, data):
+        if self.fault == 'crlf':
+            data = data.replace(b'\n', b'\r\n')
         for offset in range(0, len(data), 1024):
             os.write(self.master, data[offset:offset + 1024])
 
@@ -91,8 +93,10 @@ class Device:
                 os.close(self.master)
                 self.master = -1
                 return
-            if self.fault == 'device_error':
-                self.write(frame(f'ERROR,{self.token},FIFO_OVERFLOW'))
+            if self.fault in ('device_error', 'timing_detail'):
+                reason = ('TIMING_UNCERTAIN:window_us=239:limit_us=156:work=USB'
+                          if self.fault == 'timing_detail' else 'FIFO_OVERFLOW')
+                self.write(frame(f'ERROR,{self.token},{reason}'))
                 self.command()
                 return
             rows = []

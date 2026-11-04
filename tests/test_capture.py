@@ -8,7 +8,7 @@ import signal
 
 import pytest
 
-from device import Device
+from device import Device, frame
 
 
 @pytest.mark.parametrize('rate', [200, 400, 800, 1600])
@@ -59,6 +59,48 @@ def test_q_cancellation_is_bounded_when_serial_becomes_silent(binary, tmp_path):
         assert device.process.returncode != 0
         assert b'STOP confirmation timeout' in stderr
         assert time.monotonic() - started < 2
+    finally:
+        device.close()
+
+
+def test_malformed_sample_reports_payload_without_accepting_data(binary, tmp_path):
+    payload = 'S,0,lu,4096,0,16384,20'
+    path = tmp_path / 'malformed.csv'
+    device = Device(binary, path, count=1, records=[frame(payload)]).start()
+    try:
+        _, stderr = device.finish()
+        assert device.process.returncode != 0
+        assert f'Rejected sample payload (7 fields): {payload}'.encode() in stderr
+        assert b'Captured 0 samples; Malformed sample frame' in stderr
+        assert json.loads(Path(str(path) + '.meta.json').read_text())['valid'] is False
+    finally:
+        device.close()
+
+
+def test_firmware_timing_diagnostics_are_reported_and_capture_stays_invalid(binary, tmp_path):
+    path = tmp_path / 'timing.csv'
+    device = Device(binary, path, fault='timing_detail').start()
+    try:
+        _, stderr = device.finish()
+        assert device.process.returncode != 0
+        assert b'Device error: TIMING_UNCERTAIN:window_us=239:limit_us=156:work=USB' in stderr
+        assert b'verified complete' not in stderr
+        assert json.loads(Path(str(path) + '.meta.json').read_text())['valid'] is False
+    finally:
+        device.close()
+
+
+def test_crlf_frames_preserve_capture_and_stop(binary, tmp_path):
+    path = tmp_path / 'crlf.csv'
+    device = Device(binary, path, fault='crlf').start()
+    try:
+        _, stderr = device.finish()
+        assert device.process.returncode == 0, stderr.decode()
+        assert device.error is None
+        assert device.stopped.is_set()
+        metadata = json.loads(Path(str(path) + '.meta.json').read_text())
+        assert metadata['valid'] is True
+        assert metadata['samples'] == device.count
     finally:
         device.close()
 

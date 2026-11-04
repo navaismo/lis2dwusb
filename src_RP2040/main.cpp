@@ -37,12 +37,42 @@ unsigned discard = 0;
 char token[9] = "00000000";
 char input[LIS_LINE_SIZE], pending[LIS_LINE_SIZE], control[LIS_LINE_SIZE];
 size_t input_size = 0, pending_size = 0, pending_offset = 0;
+enum class TxState { IDLE, FIELDS, CHECKSUM, SEND };
+TxState tx_state = TxState::IDLE;
+Sample transmitting;
+size_t payload_size = 0, checksum_offset = 0;
+unsigned tx_field = 0;
+uint16_t checksum = 0xFFFF;
+const char *last_work = "START";
+constexpr size_t USB_PACKET_SIZE = 64;
+constexpr uint64_t USB_FLUSH_US = 1000;
+uint8_t usb_packet[USB_PACKET_SIZE];
+size_t usb_size = 0, usb_offset = 0;
+uint64_t usb_started = 0;
+bool usb_flush = false, pending_control = false;
+uint32_t formatted_samples = 0, usb_writes = 0, usb_busy = 0;
 
 uint64_t nowUs() {
     const uint32_t tick = micros();
     clock_us += uint32_t(tick - last_tick);
     last_tick = tick;
     return clock_us;
+}
+void decimalTime(char (&output)[21], uint64_t value) {
+    // The pinned Newlib Nano printf cannot format 64-bit integers.
+    char reversed[20];
+    size_t count = 0;
+    while (value > UINT32_MAX) {
+        reversed[count++] = char('0' + value % 10);
+        value /= 10;
+    }
+    uint32_t small = uint32_t(value);
+    do {
+        reversed[count++] = char('0' + small % 10);
+        small /= 10;
+    } while (small);
+    for (size_t i = 0; i < count; ++i) output[i] = reversed[count - i - 1];
+    output[count] = 0;
 }
 void writeReg(uint8_t address, uint8_t value) {
     digitalWrite(CS_PIN, LOW);
@@ -51,30 +81,41 @@ void writeReg(uint8_t address, uint8_t value) {
     digitalWrite(CS_PIN, HIGH);
 }
 uint8_t readReg(uint8_t address) {
+    const char tx[2] = {char(address | 0x80), 0};
+    char rx[2] = {};
     digitalWrite(CS_PIN, LOW);
-    spi.write(address | 0x80);
-    const uint8_t value = spi.write(0);
+    spi.write(tx, sizeof(tx), rx, sizeof(rx));
     digitalWrite(CS_PIN, HIGH);
-    return value;
+    return uint8_t(rx[1]);
 }
 void readAxes(int16_t *axes) {
+    const char tx[7] = {char(OUT_X_L | 0x80), 0, 0, 0, 0, 0, 0};
+    char rx[7] = {};
     digitalWrite(CS_PIN, LOW);
-    spi.write(OUT_X_L | 0x80);
+    spi.write(tx, sizeof(tx), rx, sizeof(rx));
+    digitalWrite(CS_PIN, HIGH);
     for (unsigned axis = 0; axis < 3; ++axis) {
-        const uint8_t low = spi.write(0), high = spi.write(0);
+        const uint8_t low = uint8_t(rx[1 + 2 * axis]), high = uint8_t(rx[2 + 2 * axis]);
         axes[axis] = int16_t(uint16_t(low) | (uint16_t(high) << 8));
     }
-    digitalWrite(CS_PIN, HIGH);
 }
 void powerDown() {
     active = false;
     writeReg(CTRL1, 0);
     writeReg(FIFO_CTRL, 0);
 }
+void discardUnsent() {
+    // Finish any partly transmitted line before emitting a control response.
+    if (tx_state != TxState::SEND || !pending_offset) {
+        tx_state = TxState::IDLE;
+        pending_size = pending_offset = 0;
+    }
+}
 void fail(const char *reason) {
     powerDown();
     finishing = false;
     queued = head = tail = 0;
+    discardUnsent();
     snprintf(control, sizeof(control), "ERROR,%s,%s", token, reason);
 }
 bool configure(unsigned requested) {
@@ -108,6 +149,7 @@ void command(char *line) {
         powerDown();
         queued = head = tail = 0;
         finishing = false;
+        discardUnsent();
         strcpy(token, argument);
         snprintf(control, sizeof(control), "LIS2DWUSB,2,%s", token);
         return;
@@ -122,6 +164,7 @@ void command(char *line) {
         if (!configure(unsigned(requested))) { fail("SENSOR_CONFIG"); return; }
         rate = unsigned(requested);
         sequence = 0;
+        formatted_samples = usb_writes = usb_busy = 0;
         epoch = last_empty = last_sample = last_tx = nowUs();
         active = true;
         snprintf(control, sizeof(control), "READY,2,%s,%u,16384,POLL", token, unsigned(rate));
@@ -136,7 +179,9 @@ void command(char *line) {
 }
 void receiveCommands() {
     // Bound command work so a noisy host cannot starve acquisition.
-    for (unsigned i = 0; i < 32 && _SerialUSB.available(); ++i) {
+    const unsigned budget = active ? 4 : 32;
+    for (unsigned i = 0; i < budget && _SerialUSB.available(); ++i) {
+        last_work = "COMMAND";
         const int value = _SerialUSB.read();
         if (value == '\r') continue;
         if (value == '\n') {
@@ -168,8 +213,23 @@ void acquire() {
     last_sample = observed;
     if (discard) { --discard; last_empty = nowUs(); return; }
     const uint64_t window = observed - last_empty;
-    if (window > 1000000UL / rate / 4) { fail("TIMING_UNCERTAIN"); return; }
-    if (queued == QUEUE_SIZE || sequence == UINT32_MAX) { fail("BUFFER_OVERFLOW"); return; }
+    const unsigned limit = 1000000UL / rate / 4;
+    if (window > limit) {
+        char width[21], reason[112];
+        decimalTime(width, window);
+        snprintf(reason, sizeof(reason), "TIMING_UNCERTAIN:window_us=%s:limit_us=%u:work=%s",
+                 width, limit, last_work);
+        fail(reason);
+        return;
+    }
+    if (queued == QUEUE_SIZE || sequence == UINT32_MAX) {
+        char reason[112];
+        snprintf(reason, sizeof(reason), "BUFFER_OVERFLOW:acq=%" PRIu32 ":fmt=%" PRIu32
+                 ":usb_ok=%" PRIu32 ":usb_busy=%" PRIu32,
+                 sequence, formatted_samples, usb_writes, usb_busy);
+        fail(reason);
+        return;
+    }
     for (unsigned axis = 0; axis < 3; ++axis)
         if (axes[axis] >= 32760 || axes[axis] <= -32760) { fail("CLIPPING"); return; }
     Sample &sample = samples[head];
@@ -181,34 +241,114 @@ void acquire() {
     ++queued;
 }
 void transmit() {
-    if (pending_offset == pending_size) {
+    if (active && nowUs() - last_tx > 2000000) { fail("USB_TIMEOUT"); return; }
+    if (usb_size && (usb_size == sizeof(usb_packet) || usb_flush || nowUs() - usb_started >= USB_FLUSH_US)) {
+        last_work = "USB";
+        uint32_t sent = 0;
+        // Submit full CDC packets during streaming; controls and tails flush promptly.
+        _SerialUSB.send_nb(usb_packet + usb_offset, uint32_t(usb_size - usb_offset), &sent);
+        usb_offset += sent;
+        if (sent) {
+            last_tx = nowUs();
+            if (usb_writes != UINT32_MAX) ++usb_writes;
+        } else if (usb_busy != UINT32_MAX) ++usb_busy;
+        if (usb_offset == usb_size) {
+            usb_size = usb_offset = 0;
+            usb_flush = false;
+        }
+        return;
+    }
+    if (tx_state == TxState::IDLE) {
         pending_offset = pending_size = 0;
-        char payload[LIS_LINE_SIZE] = {};
         if (control[0]) {
-            strcpy(payload, control);
+            pending_control = true;
+            strcpy(pending, control);
             control[0] = 0;
         } else if (queued) {
-            const Sample &s = samples[tail];
-            snprintf(payload, sizeof(payload), "S,%" PRIu32 ",%" PRIu64 ",%d,%d,%d,%" PRIu32,
-                     s.sequence, s.time, int(s.axes[0]), int(s.axes[1]), int(s.axes[2]), s.window);
+            pending_control = false;
+            transmitting = samples[tail];
             tail = (tail + 1) % QUEUE_SIZE;
             --queued;
+            pending[0] = 'S';
+            payload_size = 1;
+            tx_field = 0;
+            tx_state = TxState::FIELDS;
+            return;
         } else if (finishing) {
-            snprintf(payload, sizeof(payload), "DONE,%s,%" PRIu32, token, sequence);
+            pending_control = true;
+            snprintf(pending, sizeof(pending), "DONE,%s,%" PRIu32, token, sequence);
             finishing = false;
-        }
-        if (!payload[0]) return;
-        const int size = lis_frame(pending, sizeof(pending), payload);
-        if (size < 0) { fail("FRAME_SIZE"); return; }
-        pending_size = size_t(size);
+        } else return;
+        payload_size = strlen(pending);
+        checksum_offset = 0;
+        checksum = 0xFFFF;
+        tx_state = TxState::CHECKSUM;
+        return;
     }
-    uint32_t sent = 0;
-    // Ordinary Serial.write blocks; the pinned mbed CDC API does not.
-    _SerialUSB.send_nb(reinterpret_cast<uint8_t *>(pending + pending_offset),
-                   uint32_t(pending_size - pending_offset), &sent);
-    pending_offset += sent;
-    if (sent) last_tx = nowUs();
-    if (active && nowUs() - last_tx > 2000000) fail("USB_TIMEOUT");
+    if (tx_state == TxState::FIELDS) {
+        last_work = "FORMAT";
+        uint64_t value;
+        bool negative = false;
+        if (tx_field == 0) value = transmitting.sequence;
+        else if (tx_field == 1) value = transmitting.time;
+        else if (tx_field < 5) {
+            const int axis = transmitting.axes[tx_field - 2];
+            negative = axis < 0;
+            value = unsigned(negative ? -axis : axis);
+        } else value = transmitting.window;
+        char digits[21];
+        decimalTime(digits, value);
+        const size_t length = strlen(digits);
+        if (payload_size + 1 + size_t(negative) + length + 6 > sizeof(pending)) {
+            fail("FRAME_SIZE"); return;
+        }
+        pending[payload_size++] = ',';
+        if (negative) pending[payload_size++] = '-';
+        memcpy(pending + payload_size, digits, length);
+        payload_size += length;
+        if (++tx_field == 6) {
+            checksum_offset = 0;
+            checksum = 0xFFFF;
+            tx_state = TxState::CHECKSUM;
+        }
+        return;
+    }
+    if (tx_state == TxState::CHECKSUM) {
+        last_work = "CRC";
+        const size_t remaining = payload_size - checksum_offset;
+        const size_t count = remaining < 8 ? remaining : 8;
+        checksum = lis_crc16_update(checksum, pending + checksum_offset, count);
+        checksum_offset += count;
+        if (checksum_offset == payload_size) {
+            static const char hex[] = "0123456789ABCDEF";
+            pending[payload_size] = '*';
+            for (unsigned i = 0; i < 4; ++i)
+                pending[payload_size + 1 + i] = hex[(checksum >> (12 - 4 * i)) & 15];
+            pending[payload_size + 5] = '\n';
+            pending_size = payload_size + 6;
+            tx_state = TxState::SEND;
+        }
+        return;
+    }
+    last_work = "PACKET";
+    if (pending_control && !pending_offset && (usb_size + pending_size) % sizeof(usb_packet) == 0) {
+        // A control must finish in a short packet so the host can deliver its tail.
+        if (pending_size == sizeof(pending)) { fail("FRAME_SIZE"); return; }
+        pending[pending_size - 1] = '\r';
+        pending[pending_size++] = '\n';
+    }
+    const size_t remaining = pending_size - pending_offset;
+    const size_t free = sizeof(usb_packet) - usb_size;
+    const size_t count = remaining < free ? remaining : free;
+    if (!usb_size) usb_started = nowUs();
+    memcpy(usb_packet + usb_size, pending + pending_offset, count);
+    usb_size += count;
+    pending_offset += count;
+    if (pending_offset == pending_size) {
+        if (pending_control) usb_flush = true;
+        else ++formatted_samples;
+        tx_state = TxState::IDLE;
+    }
 }
 }  // namespace
 
@@ -227,10 +367,17 @@ void loop() {
         finishing = false;
         queued = head = tail = 0;
         pending_size = pending_offset = input_size = 0;
+        tx_state = TxState::IDLE;
+        usb_size = usb_offset = 0;
+        usb_flush = false;
         control[0] = 0;
         return;
     }
     acquire();
     receiveCommands();
-    transmit();
+    // Amortize command/loop overhead while polling between every bounded TX step.
+    for (unsigned i = 0; i < 8; ++i) {
+        acquire();
+        transmit();
+    }
 }

@@ -37,6 +37,8 @@ python3 -m pytest -q
 creates `.pio/build/btt_lis2dw/firmware.uf2`; `pio run` does not upload it.
 Review and physically validate the new firmware before installation on a printer.
 The wrapper build needs no pigpio library and runs without sudo.
+Make always rebuilds the wrapper with the selected compiler, so a copied binary
+from another CPU architecture cannot bypass compilation based on timestamps.
 
 ## Installation
 
@@ -51,6 +53,27 @@ The installer builds and installs `/usr/local/bin/lis2dwusb` and adds that accou
 to `dialout`. Restart the OctoPrint service to refresh group membership. The
 installer does not flash firmware, connect to a sensor or create sudoers rules.
 Review existing sudoers entries separately if an old installer created them.
+
+If running the wrapper reports `cannot execute binary file: Exec format error`,
+check the host architecture and executable format on the affected machine:
+
+```bash
+uname -m
+file /usr/local/bin/lis2dwusb
+```
+
+Rebuild from the complete source tree **on that machine** with its native C
+compiler, then replace only the installed wrapper:
+
+```bash
+make -B -C Linux_Wrapper
+Linux_Wrapper/lis2dwusb -V
+sudo make -B -C Linux_Wrapper install
+/usr/local/bin/lis2dwusb -V
+```
+
+The version checks do not open a serial device. An x86-64 executable cannot run
+natively on an ARM Raspberry Pi; changing permissions does not fix its format.
 
 Firmware flashing is a separate operator step after review. Use the newly built
 protocol 2 UF2, not the existing 0.2.2 release files. The wrapper rejects legacy
@@ -98,6 +121,9 @@ C++ harness also executes the actual firmware source with simulated SPI and USB.
 It covers rates, raw units, partial USB writes, timestamp rollover, FIFO/software
 overflow, uncertain timing, missing data, clipping, initialization failure,
 checksums, sequence gaps, rate/session mismatch, disconnection and bounded stop.
+The harness also covers ten-second synthetic captures with SPI-call costs and
+delayed short USB packets, plus aborts across USB packet boundaries. These costs
+are injected test conditions, not measured target timings or USB guarantees.
 
 An optional integration check exercises the real plugin capturer and analyzer:
 

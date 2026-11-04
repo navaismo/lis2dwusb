@@ -11,7 +11,8 @@ not changed by this work.
 
 Each command and response is ASCII: `PAYLOAD*CCCC\n`, where `CCCC` is four hex
 digits of CRC-16/CCITT-FALSE over PAYLOAD (polynomial 0x1021, initial 0xffff,
-no reflection or final XOR; `123456789` gives 0x29b1). The maximum line buffer
+no reflection or final XOR; `123456789` gives 0x29b1). CRLF is also accepted;
+control responses use it when needed to end in a short USB packet. The maximum line buffer
 is 160 bytes including terminator. CSV output is a separate host-facing format.
 
 The Linux wrapper generates an eight-digit hex session nonce. HELLO stops any
@@ -63,16 +64,44 @@ evidence. The plugin retains its independent jitter/gap validation.
 The 32-bit microsecond ticker is extended to 64 bits by unsigned delta
 accumulation on every main-loop iteration, including idle operation. Output
 times therefore continue across the approximately 71-minute ticker rollover.
+The firmware converts the full 64-bit timestamp to decimal explicitly because
+the pinned target's Newlib Nano `printf` does not support 64-bit integer formats.
+The host firmware harness rejects wide integer formatting arguments and checks
+serialization through `UINT64_MAX`; Linux libc alone would hide this limitation.
 The sample counter aborts before wrapping. Sensor ODR tolerance is reflected
 in measured timestamps, not removed by scaling them to the requested rate.
 
 ## Buffering and stop
 
-A fixed queue holds 256 accepted samples. Formatting and the pinned mbed USB
-CDC `send_nb` API run separately from acquisition; no USB send waits for the
-host. Partial writes retain the unsent suffix. Queue exhaustion invalidates the
+A fixed queue holds 256 accepted samples, with one additional sample held by the
+serializer. Each bounded serializer step formats at most one numeric field,
+computes CRC over at most eight payload bytes, copies a frame suffix to the USB
+packet buffer, or attempts one nonblocking USB write. The main loop processes
+up to eight steps, polling the FIFO before every step. Active captures consume
+at most four command bytes per loop. FIFO status and XYZ are read with one
+buffered SPI transaction each, avoiding a separate driver call per byte. The
+timing acceptance limit is unchanged and still needs physical validation.
+
+A 64-byte staging buffer combines ASCII frames into full USB CDC packets. Frame
+boundaries and CRCs are independent of USB packet boundaries. Partly filled
+packets flush after 1 ms, or promptly after a control response, including DONE.
+Control responses always terminate in a short packet, including when adding a
+CR before LF is necessary to avoid an exact 64-byte boundary.
+The sender preserves partial writes and finishes a partly transmitted frame
+before emitting ERROR. This reduces short-packet overhead without adding sample
+queue capacity or assuming a host throughput guarantee. Queue exhaustion invalidates the
 capture; no sample is silently dropped. Commands are processed with a bounded
 byte budget to prevent command traffic from starving acquisition.
+
+`TIMING_UNCERTAIN` includes colon-separated `window_us`, `limit_us` and `work`
+details in its reason field. `work` identifies the most recent format, CRC, USB
+or command step; it helps locate delays but does not measure their individual
+execution times. The wrapper reports these details and rejects the capture.
+`BUFFER_OVERFLOW` includes `acq` (accepted samples), `fmt` (sample frames copied
+to the USB staging buffer), `usb_ok` (successful nonblocking write calls) and
+`usb_busy` (write calls that accepted zero bytes). These counters help separate
+serialization pressure from USB backpressure; they do not establish capture
+validity or the number of samples received by the host.
 
 A sensor producing no samples for 500 ms fails. Configuration, uncertain
 observation, clipping near full scale, FIFO or queue overflow and USB stalls

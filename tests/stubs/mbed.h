@@ -6,6 +6,19 @@ struct SPI {
     void frequency(int) {}
     void format(int, int) {}
     int write(int value) {
+        fake_time += spi_call_cost_us;
+        return transfer(value);
+    }
+    int write(const char *tx, int tx_size, char *rx, int rx_size) {
+        fake_time += spi_call_cost_us;
+        const int length = std::max(tx_size, rx_size);
+        for (int i = 0; i < length; ++i) {
+            const int value = transfer(i < tx_size ? uint8_t(tx[i]) : 0xff);
+            if (i < rx_size) rx[i] = char(value);
+        }
+        return length;
+    }
+    int transfer(int value) {
         ++fake_time;
         if (transaction_offset++ == 0) {
             transaction_address = unsigned(value) & 0x7f;

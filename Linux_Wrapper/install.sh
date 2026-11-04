@@ -14,7 +14,6 @@ script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 getent group dialout >/dev/null || { echo "The dialout serial group is required." >&2; exit 1; }
 apt-get update
 apt-get install -y build-essential make
-make -C "$script_dir"
 make -C "$script_dir" install
 usermod -a -G dialout "$service_user"
 echo "Installed the protocol 2 wrapper. Restart the OctoPrint service to refresh group membership."

@@ -136,6 +136,9 @@ static void line_received(struct Capture *capture, char *line) {
             || !number(fields[2], &timestamp) || !axis_value(fields[3], &axes[0])
             || !axis_value(fields[4], &axes[1]) || !axis_value(fields[5], &axes[2])
             || !number(fields[6], &window)) {
+        fprintf(stderr, "Rejected sample payload (%u fields): ", count);
+        for (unsigned i = 0; i < count; ++i) fprintf(stderr, "%s%s", i ? "," : "", fields[i]);
+        fputc('\n', stderr);
         fail(capture, "Malformed sample frame"); return;
     }
     if (sequence != capture->samples || sequence >= UINT32_MAX) {

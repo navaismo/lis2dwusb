@@ -10,14 +10,16 @@
 #define LIS_COUNTS_PER_G 16384
 
 /* CRC-16/CCITT-FALSE covers the payload before the asterisk. */
-static inline uint16_t lis_crc16(const char *data, size_t size) {
-    uint16_t crc = 0xFFFF;
+static inline uint16_t lis_crc16_update(uint16_t crc, const char *data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         crc ^= (uint16_t)(unsigned char)data[i] << 8;
         for (unsigned bit = 0; bit < 8; ++bit)
             crc = (uint16_t)((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1);
     }
     return crc;
+}
+static inline uint16_t lis_crc16(const char *data, size_t size) {
+    return lis_crc16_update(0xFFFF, data, size);
 }
 static inline int lis_hex(char c) {
     if (c >= '0' && c <= '9') return c - '0';

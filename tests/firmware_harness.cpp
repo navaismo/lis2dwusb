@@ -11,6 +11,10 @@ uint8_t registers[64] = {};
 unsigned transaction_address = 0, transaction_offset = 0, fifo_count = 0;
 bool reading = false, fifo_overflow = false, produce = true, reset_stuck = false;
 int raw_axis = 4096;
+int raw_y = 0, raw_z = 16384;
+unsigned ctrl6_reads = 0, axes_reads = 0;
+uint8_t fifo_flags = 0;
+bool mutate_on_ctrl6_read = false;
 uint64_t next_sample = 0;
 unsigned sensor_period = 625;
 unsigned spi_call_cost_us = 0;
@@ -70,6 +74,57 @@ int main(int argc, char **argv) {
     if (scenario == "reset") reset_stuck = true;
     setup();
     assert(lis_crc16("123456789", 9) == 0x29b1);
+    if (scenario == "clipping_format" || scenario == "clipping_candidate") {
+        assert(argc >= 6);
+        const int16_t axes[] = {int16_t(std::stoi(argv[3])), int16_t(std::stoi(argv[4])),
+                                int16_t(std::stoi(argv[5]))};
+        strcpy(token, "1234abcd");
+        assert(configure(800));
+        assert(ctrl6_reads == 1 && verified_ctrl6 == 0 && discard == 2);
+        registers[CTRL6] = 0x30;
+        mutate_on_ctrl6_read = true;
+        bool diagnostic_expected = true;
+        if (scenario == "clipping_format") {
+            sequence = UINT32_MAX - 1;
+            registers[CTRL6] = 0xFF;
+            failClipping(axes, 0xFF, UINT64_MAX);
+            assert(axes_reads == 0);
+            const size_t padding = argc > 6 ? size_t(std::stoul(argv[6])) : 0;
+            assert(padding < USB_PACKET_SIZE);
+            memset(tx_bytes, '\r', padding);
+            tx_head = tx_queued = padding;
+            tx_tail = 0;
+            _SerialUSB.write_limit = 5;
+        } else {
+            raw_axis = axes[0]; raw_y = axes[1]; raw_z = axes[2];
+            sequence = argc > 6 ? unsigned(std::stoul(argv[6])) : 339;
+            const uint32_t candidate = sequence;
+            rate = 800; active = true; discard = 0; produce = false;
+            fifo_count = 1; fifo_flags = 0x80;
+            epoch = nowUs() - 100; last_empty = nowUs() - 10;
+            const uint64_t expected_time = 96;
+            acquire();
+            assert(axes_reads == 1);
+            const bool clipped = axes[0] >= 32760 || axes[0] <= -32760
+                || axes[1] >= 32760 || axes[1] <= -32760 || axes[2] >= 32760 || axes[2] <= -32760;
+            diagnostic_expected = clipped;
+            assert(active != clipped);
+            if (clipped) {
+                assert(sequence == candidate && queued == 0 && !finishing);
+                assert(strstr(control, ":t_us=96:") != nullptr);
+            } else {
+                assert(sequence == candidate + 1 && queued == 1);
+                assert(samples[tail].time == expected_time);
+                powerDown();
+            }
+        }
+        assert(ctrl6_reads == (diagnostic_expected ? 2U : 1U));
+        assert(!active && registers[CTRL1] == 0 && registers[FIFO_CTRL] == 0);
+        drain();
+        if (scenario == "clipping_format") assert(_SerialUSB.last_write_size < USB_PACKET_SIZE);
+        std::cout << _SerialUSB.output;
+        return 0;
+    }
     if (scenario == "control_boundary") {
         for (size_t padding = 0; padding < USB_PACKET_SIZE; ++padding) {
             // CR padding is ignored by the line reader and selects each alignment.
@@ -161,5 +216,6 @@ int main(int argc, char **argv) {
         }
     }
     drain();
+    assert(ctrl6_reads == (scenario == "clipping" ? 2U : scenario == "identity" || scenario == "reset" ? 0U : 1U));
     std::cout << _SerialUSB.output;
 }

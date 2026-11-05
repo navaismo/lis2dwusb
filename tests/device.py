@@ -16,12 +16,13 @@ def frame(payload):
 
 
 class Device:
-    def __init__(self, binary, output, *, rate=1600, count=128, fault=None, records=None):
+    def __init__(self, binary, output, *, rate=1600, count=128, fault=None, records=None, error_reason=None):
         self.master, self.slave = pty.openpty()
         self.port = os.ttyname(self.slave)
         self.binary, self.output = binary, output
         self.rate, self.count, self.fault = rate, count, fault
         self.records = records
+        self.error_reason = error_reason
         self.error = None
         self.token = None
         self.ready = threading.Event()
@@ -92,6 +93,13 @@ class Device:
             if self.fault == 'disconnect':
                 os.close(self.master)
                 self.master = -1
+                return
+            if self.error_reason is not None:
+                record = frame(f'ERROR,{self.token},{self.error_reason}')
+                if self.fault == 'error_crc':
+                    record = record[:-5] + bytes([record[-5] ^ 1]) + record[-4:]
+                self.write(record)
+                self.command()
                 return
             if self.fault in ('device_error', 'timing_detail'):
                 reason = ('TIMING_UNCERTAIN:window_us=239:limit_us=156:work=USB'

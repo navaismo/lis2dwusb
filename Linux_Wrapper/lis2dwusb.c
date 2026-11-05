@@ -151,7 +151,15 @@ static void line_received(struct Capture *capture, char *line) {
         fail(capture, "Invalid acquisition timing or uncertain sample edge"); return;
     }
     for (unsigned i = 0; i < 3; ++i)
-        if (axes[i] >= 32760 || axes[i] <= -32760) { fail(capture, "Sensor full-scale clipping"); return; }
+        if (axes[i] >= 32760 || axes[i] <= -32760) {
+            unsigned hit = 0;
+            for (unsigned axis = 0; axis < 3; ++axis)
+                if (axes[axis] >= 32760 || axes[axis] <= -32760) hit |= 1U << axis;
+            fprintf(stderr, "Clipping diagnostic:source=wrapper:why=raw_limit:seq=%" PRIu64
+                ":t_us=%" PRIu64 ":x=%ld:y=%ld:z=%ld:hit=%u:fs=2:counts_per_g=%u\n",
+                sequence, timestamp, axes[0], axes[1], axes[2], hit, (unsigned)LIS_COUNTS_PER_G);
+            fail(capture, "Sensor full-scale clipping"); return;
+        }
     if (fprintf(capture->csv, "%" PRIu64 ".%06" PRIu64 ",%.10f,%.10f,%.10f\n",
             timestamp / 1000000, timestamp % 1000000,
             axes[0] / (double)LIS_COUNTS_PER_G, axes[1] / (double)LIS_COUNTS_PER_G,

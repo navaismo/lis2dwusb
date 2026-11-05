@@ -90,6 +90,48 @@ def test_firmware_timing_diagnostics_are_reported_and_capture_stays_invalid(bina
         device.close()
 
 
+@pytest.mark.parametrize('axis', range(3))
+@pytest.mark.parametrize('raw', [32756, 32760, 32764, -32756, -32760, -32768])
+def test_wrapper_clipping_diagnostic_preserves_axis_threshold_and_invalid_capture(binary, tmp_path, axis, raw):
+    axes = [0, 0, 0]
+    axes[axis] = raw
+    payload = f'S,0,1250,{axes[0]},{axes[1]},{axes[2]},20'
+    path = tmp_path / 'local-clipping.csv'
+    device = Device(binary, path, rate=800, count=1, records=[frame(payload)]).start()
+    try:
+        _, stderr = device.finish()
+        clipped = raw >= 32760 or raw <= -32760
+        assert device.process.returncode == (2 if clipped else 0)
+        metadata = json.loads(Path(str(path) + '.meta.json').read_text())
+        assert metadata['valid'] is not clipped
+        if clipped:
+            assert (f'Clipping diagnostic:source=wrapper:why=raw_limit:seq=0:t_us=1250'
+                f':x={axes[0]}:y={axes[1]}:z={axes[2]}:hit={1 << axis}:fs=2:counts_per_g=16384').encode() in stderr
+            assert b'Captured 0 samples; Sensor full-scale clipping' in stderr
+            assert path.read_text() == 'time,x,y,z\n'
+        else:
+            assert b'Clipping diagnostic:' not in stderr
+        assert b'Device error:' not in stderr
+    finally:
+        device.close()
+
+
+def test_wrapper_clipping_reports_all_axes_and_candidate_after_accepted_samples(binary, tmp_path):
+    path = tmp_path / 'all-axes.csv'
+    records = [frame('S,0,1250,0,0,16384,20'), frame('S,1,2500,-32768,32764,-32760,20')]
+    device = Device(binary, path, rate=800, count=2, records=records).start()
+    try:
+        _, stderr = device.finish()
+        assert device.process.returncode == 2
+        assert b'seq=1:t_us=2500:x=-32768:y=32764:z=-32760:hit=7:' in stderr
+        assert b'Captured 1 samples; Sensor full-scale clipping' in stderr
+        metadata = json.loads(Path(str(path) + '.meta.json').read_text())
+        assert metadata['valid'] is False and metadata['samples'] == 1
+        assert len(path.read_text().splitlines()) == 2
+    finally:
+        device.close()
+
+
 def test_crlf_frames_preserve_capture_and_stop(binary, tmp_path):
     path = tmp_path / 'crlf.csv'
     device = Device(binary, path, fault='crlf').start()

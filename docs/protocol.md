@@ -110,6 +110,42 @@ to the transmit ring), `usb_ok` (successful nonblocking write calls) and
 serialization pressure from USB backpressure; they do not establish capture
 validity or the number of samples received by the host.
 
+`CLIPPING` retains the same per-axis raw limits (`>=32760` or `<=-32760`) and
+adds failure-only details inside the existing third ERROR field, for example:
+
+```text
+ERROR,0123abcd,CLIPPING:why=raw_limit:seq=339:t_us=427500:x=32764:y=-16:z=16380:hit=1:fifo=01:fs=2:c6=00:c6v=00:c6f=00
+```
+
+The example is illustrative; the normal CRC suffix and newline are omitted.
+`seq` is the rejected candidate's zero-based index, before incrementing the
+accepted-sample counter. `t_us` uses the same device epoch and observation-window
+midpoint as accepted sample frames. `x/y/z` are the original signed register
+words. `hit` is a decimal bitmask: X=1, Y=2, Z=4; every crossing axis is included.
+`fifo` is the hexadecimal FIFO_SAMPLES byte observed before reading that sample.
+`fs` is the configured full-scale magnitude in g, still 2. `c6` is configured
+CTRL6, `c6v` is its verified startup readback, and `c6f` is a separate fault-time
+readback, all hexadecimal. The latter is read only after preserving the original
+candidate, timestamp, mask and FIFO status; XYZ is not read again. A fault-time
+readback is diagnostic evidence, not an independently verified sensor state.
+
+No diagnostic formatting or additional register read runs for an accepted
+sample. The compile-time maximum ERROR size is 153 bytes including the nonce,
+CRC, optional CR, newline and NUL, within the unchanged 160-byte line buffer.
+The reason uses colons rather than extra commas, so existing protocol-2 wrappers
+display it unchanged. An unexpected formatting failure still aborts with
+`CLIPPING:why=diagnostic_format`. No triggering sample is written to CSV, no
+DONE is emitted, and already accepted but unsent samples can be discarded.
+Consequently, the wrapper's received sample count can be lower than `seq`.
+
+The wrapper's independent guard keeps its existing failure summary and also
+prints `Clipping diagnostic:source=wrapper:why=raw_limit` followed by `seq`,
+`t_us`, raw `x/y/z`, the complete `hit` mask, `fs` and `counts_per_g`. It cannot
+recover XYZ from a bare firmware ERROR or obtain sensor register/FIFO state.
+Both paths retain exit code 2 and invalid metadata. A near-rail decoded word
+does not by itself distinguish physical saturation from an incorrect SPI read;
+the USB CRC protects the subsequent framed transmission.
+
 A sensor producing no samples for 500 ms fails. Configuration, uncertain
 observation, clipping near full scale, FIFO or queue overflow and USB stalls
 produce ERROR and power down sampling. STOP also powers down sampling, but

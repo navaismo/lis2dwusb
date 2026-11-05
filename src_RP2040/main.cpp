@@ -20,6 +20,8 @@
 namespace {
 constexpr uint8_t WHO_AM_I = 0x0F, CTRL1 = 0x20, CTRL2 = 0x21, CTRL6 = 0x25;
 constexpr uint8_t OUT_X_L = 0x28, FIFO_CTRL = 0x2E, FIFO_SAMPLES = 0x2F;
+constexpr uint8_t CONFIGURED_CTRL6 = 0x00;
+uint8_t verified_ctrl6 = 0;
 constexpr size_t QUEUE_SIZE = 256;
 mbed::SPI spi(digitalPinToPinName(MOSI_PIN), digitalPinToPinName(MISO_PIN), digitalPinToPinName(SCK_PIN));
 struct Sample {
@@ -122,6 +124,31 @@ void fail(const char *reason) {
     discardUnsent();
     snprintf(control, sizeof(control), "ERROR,%s,%s", token, reason);
 }
+// Keep diagnostic formatting and its stack frame off the successful acquisition path.
+__attribute__((noinline)) void failClipping(const int16_t *axes, uint8_t fifo_status, uint64_t timestamp) {
+    // Preserve the original candidate before the failure-only register read.
+    const uint32_t candidate = sequence;
+    const int x = axes[0], y = axes[1], z = axes[2];
+    unsigned hit = 0;
+    for (unsigned axis = 0; axis < 3; ++axis)
+        if (axes[axis] >= 32760 || axes[axis] <= -32760) hit |= 1U << axis;
+    const uint8_t startup_ctrl6 = verified_ctrl6;
+    const uint8_t fault_ctrl6 = readReg(CTRL6);
+    char time[21];
+    decimalTime(time, timestamp);
+    // Include the largest field values, CRC, optional CR and NUL in the bound.
+    constexpr size_t reason_size = sizeof("CLIPPING:why=raw_limit:seq=4294967295:t_us=18446744073709551615"
+        ":x=-32768:y=-32768:z=-32768:hit=7:fifo=FF:fs=16:c6=FF:c6v=FF:c6f=FF");
+    static_assert(sizeof("ERROR,ffffffff,") - 1 + reason_size + sizeof("*FFFF\r\n") - 1 <= LIS_LINE_SIZE,
+                  "Clipping diagnostic must fit a complete protocol frame");
+    char reason[reason_size];
+    const int size = snprintf(reason, sizeof(reason), "CLIPPING:why=raw_limit:seq=%" PRIu32
+        ":t_us=%s:x=%d:y=%d:z=%d:hit=%u:fifo=%02X:fs=%u:c6=%02X:c6v=%02X:c6f=%02X",
+        candidate, time, x, y, z, hit, unsigned(fifo_status),
+        2U << ((CONFIGURED_CTRL6 >> 4) & 3), unsigned(CONFIGURED_CTRL6),
+        unsigned(startup_ctrl6), unsigned(fault_ctrl6));
+    fail(size >= 0 && size_t(size) < sizeof(reason) ? reason : "CLIPPING:why=diagnostic_format");
+}
 bool configure(unsigned requested) {
     if (readReg(WHO_AM_I) != 0x44) return false;
     writeReg(CTRL2, 0x40);
@@ -132,10 +159,13 @@ bool configure(unsigned requested) {
     }
     // ST DS11811: BDU + address increment, high-performance mode, +/-2 g.
     writeReg(CTRL2, 0x0C);
-    writeReg(CTRL6, 0x00);
+    writeReg(CTRL6, CONFIGURED_CTRL6);
     const uint8_t odr = requested == 1600 ? 0x94 : requested == 800 ? 0x84 : requested == 400 ? 0x74 : 0x64;
     writeReg(CTRL1, odr);
-    if (readReg(CTRL1) != odr || readReg(CTRL2) != 0x0C || readReg(CTRL6) != 0) return false;
+    if (readReg(CTRL1) != odr || readReg(CTRL2) != 0x0C) return false;
+    const uint8_t ctrl6 = readReg(CTRL6);
+    if (ctrl6 != CONFIGURED_CTRL6) return false;
+    verified_ctrl6 = ctrl6;
     delay(30);
     writeReg(FIFO_CTRL, 0);
     writeReg(FIFO_CTRL, 0xC0);
@@ -235,7 +265,10 @@ void acquire() {
         return;
     }
     for (unsigned axis = 0; axis < 3; ++axis)
-        if (axes[axis] >= 32760 || axes[axis] <= -32760) { fail("CLIPPING"); return; }
+        if (axes[axis] >= 32760 || axes[axis] <= -32760) {
+            failClipping(axes, status, last_empty + window / 2 - epoch);
+            return;
+        }
     Sample &sample = samples[head];
     sample.sequence = sequence++;
     sample.time = last_empty + window / 2 - epoch;

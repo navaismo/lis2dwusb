@@ -1,5 +1,9 @@
 #pragma once
 #include "Arduino.h"
+extern int raw_y, raw_z;
+extern unsigned ctrl6_reads, axes_reads;
+extern uint8_t fifo_flags;
+extern bool mutate_on_ctrl6_read;
 namespace mbed {
 struct SPI {
     SPI(int, int, int) {}
@@ -38,17 +42,26 @@ struct SPI {
             return 0;
         }
         if (transaction_address == 0x21 && !reset_stuck) registers[0x21] &= ~0x40;
+        if (transaction_address == 0x25) {
+            ++ctrl6_reads;
+            if (mutate_on_ctrl6_read) {
+                raw_axis = 1; raw_y = 2; raw_z = 3;
+                fifo_count = 7;
+                fake_time += 100000;
+            }
+        }
         if (transaction_address == 0x2f) {
             while (produce && registers[0x20] && registers[0x2e] && next_sample <= fake_time) {
                 if (fifo_count == 32) fifo_overflow = true;
                 else ++fifo_count;
                 next_sample += sensor_period;
             }
-            return int(fifo_count | (fifo_overflow ? 0x40 : 0));
+            return int(fifo_count | fifo_flags | (fifo_overflow ? 0x40 : 0));
         }
         if (transaction_address == 0x28) {
             unsigned byte = transaction_offset - 2;
-            int16_t axis = byte < 2 ? int16_t(raw_axis) : byte >= 4 ? int16_t(16384) : int16_t(0);
+            if (!byte) ++axes_reads;
+            int16_t axis = byte < 2 ? int16_t(raw_axis) : byte >= 4 ? int16_t(raw_z) : int16_t(raw_y);
             return byte % 2 ? (uint16_t(axis) >> 8) & 255 : uint16_t(axis) & 255;
         }
         return registers[transaction_address];

@@ -1,140 +1,268 @@
 # LIS2DWUSB
 
-RP2040 firmware and a Linux USB wrapper for the BIGTREETECH S2DW (LIS2DW12)
-accelerometer, intended for OctoPrint input-shaping measurements.
+LIS2DWUSB records acceleration from the BIGTREETECH S2DW (LIS2DW12) for
+input-shaping measurements. We use an RP2040 to acquire the samples and a Linux
+wrapper to save them as CSV, with timestamps from the device.
 
-The `plugin_optimization` branch introduces **protocol 2** and remains under
-review. Firmware and wrapper must be upgraded together. Existing binaries in
-`FW_Binaries/` are legacy releases and have not been replaced. Software tests
-and a successful build do not establish physical sensor performance.
-
-## Changes
-
-- Device-side microsecond timestamps, sample sequence numbers and CRC-16 frames.
-- Explicit protocol, session, sampling-rate and scale acknowledgement.
-- FIFO monitoring, BDU and bounded polling uncertainty; ambiguous timing,
-  clipping or overflow invalidates the capture instead of concealing loss.
-- A bounded sample queue and nonblocking USB transmission.
-- Interruptible Linux reads, startup/data/stop deadlines and verified stop counts.
-- CSV output in g with preserved sensor precision and a validity metadata sidecar.
-- Exact supported rates: **200, 400, 800 and 1600 Hz**. Other rates are rejected.
-
-See [the acquisition protocol](docs/protocol.md) for the timing model and limits.
+We support 200, 400, 800 and 1600 Hz, with selectable ranges of +/-2, +/-4,
++/-8 and +/-16 g. Protocol 2 includes sequence numbers, CRC checks and explicit
+errors for clipping, lost samples and uncertain timing.
 
 ## Build
 
-Requirements: PlatformIO, a C compiler, Make, Python and pytest for offline tests.
-The firmware targets the existing SPI wiring: CS=GPIO9, SCK=GPIO10,
-MOSI=GPIO11 and MISO=GPIO8. It does not require an additional interrupt wire.
+You'll need PlatformIO for the RP2040 firmware and a C compiler with Make for
+the Linux wrapper. Run these commands from the directory containing
+`platformio.ini`:
 
 ```bash
-pio run
+pio run -e btt_lis2dw
 make -C Linux_Wrapper
-python3 -m pytest -q
 ```
 
-`platformio.ini` pins the platform, mbed framework and ARM toolchain. The build
-creates `.pio/build/btt_lis2dw/firmware.uf2`; `pio run` does not upload it.
-Review and physically validate the new firmware before installation on a printer.
-The wrapper build needs no pigpio library and runs without sudo.
-Make always rebuilds the wrapper with the selected compiler, so a copied binary
-from another CPU architecture cannot bypass compilation based on timestamps.
+The firmware is generated at:
 
-## Installation
+```text
+.pio/build/btt_lis2dw/firmware.uf2
+```
 
-Copy the **whole source tree**, including `include/`; the wrapper uses the shared
-protocol header. On Raspberry Pi OS / Debian, select the actual service account:
+Our SPI wiring is CS=GPIO9, SCK=GPIO10, MOSI=GPIO11 and MISO=GPIO8. The platform,
+mbed framework and ARM toolchain versions are set in `platformio.ini`.
+
+Build the wrapper on the machine where you'll run it. It needs no pigpio
+library, and normal captures run without sudo.
+
+### Clean builds and VS Code
+
+Save your source files before building. In VS Code, select `btt_lis2dw` and use
+PlatformIO's Clean and Build commands. From the terminal, the same steps are:
+
+```bash
+pio run -e btt_lis2dw -t clean
+pio run -e btt_lis2dw
+```
+
+A clean build shows `Generating UF2 image` and finishes with `SUCCESS`. Check
+the output file with:
+
+```bash
+stat .pio/build/btt_lis2dw/firmware.uf2
+sha256sum .pio/build/btt_lis2dw/firmware.uf2
+```
+
+An incremental build can keep the same UF2 timestamp when the image hasn't
+changed. Use the checksum to compare builds. The build output stays in `.pio`;
+copies in `FW_Binaries/` or downloaded archives aren't updated by these commands.
+
+Building doesn't flash the board. Use the generated UF2 when updating your
+RP2040. One firmware image supports all four ranges; we select the range at the
+start of each capture.
+
+## Install the wrapper
+
+Copy the complete source tree to your Raspberry Pi, including `include/`, then
+build and install:
+
+```bash
+make -C Linux_Wrapper
+Linux_Wrapper/lis2dwusb -h
+sudo make -C Linux_Wrapper install
+/usr/local/bin/lis2dwusb -h
+```
+
+The installed executable is `/usr/local/bin/lis2dwusb`. Check that its help
+includes `-r 2|4|8|16`; the version string alone isn't enough to identify range
+support.
+
+For a first-time setup on Raspberry Pi OS or Debian, we also provide an
+installer. Replace `pi` with the account that runs OctoPrint:
 
 ```bash
 sudo OCTOPRINT_USER=pi bash Linux_Wrapper/install.sh
 ```
 
-The installer builds and installs `/usr/local/bin/lis2dwusb` and adds that account
-to `dialout`. Restart the OctoPrint service to refresh group membership. The
-installer does not flash firmware, connect to a sensor or create sudoers rules.
-Review existing sudoers entries separately if an old installer created them.
+This installs the compiler and Make packages, builds the wrapper and adds the
+account to `dialout`. Restart OctoPrint to pick up the new group membership.
+Update the RP2040 firmware separately.
 
-If running the wrapper reports `cannot execute binary file: Exec format error`,
-check the host architecture and executable format on the affected machine:
+### Exec format error
+
+If you get `cannot execute binary file: Exec format error`, check that the
+executable matches your machine:
 
 ```bash
 uname -m
 file /usr/local/bin/lis2dwusb
 ```
 
-Rebuild from the complete source tree **on that machine** with its native C
-compiler, then replace only the installed wrapper:
+An x86-64 binary won't run on an ARM Raspberry Pi. Rebuild and install from
+source on the Pi using the commands above. Our Makefile always rebuilds the
+wrapper, even if a copied executable has a newer timestamp.
+
+## Capture acceleration
+
+Use the accelerometer's serial port. If you also have a printer connected,
+check which device belongs to each port.
+
+For a 50-second capture at 800 Hz and +/-16 g:
 
 ```bash
-make -B -C Linux_Wrapper
-Linux_Wrapper/lis2dwusb -V
-sudo make -B -C Linux_Wrapper install
-/usr/local/bin/lis2dwusb -V
+lis2dwusb -p /dev/ttyACM0 -f 800 -r 16 -d 50 -s capture.csv
 ```
 
-The version checks do not open a serial device. An x86-64 executable cannot run
-natively on an ARM Raspberry Pi; changing permissions does not fix its format.
-
-Firmware flashing is a separate operator step after review. Use the newly built
-protocol 2 UF2, not the existing 0.2.2 release files. The wrapper rejects legacy
-firmware; it does not silently timestamp old XYZ streams on the host.
-
-## Capture
-
-Use the sensor's stable serial path, distinct from the printer serial port:
+You can use a stable `/dev/serial/by-id/` path too:
 
 ```bash
-lis2dwusb -p /dev/serial/by-id/YOUR_SENSOR -f 1600 -s capture.csv
-lis2dwusb -p /dev/ttyACM0 -f 800 -d 5 -s short-test.csv
+lis2dwusb -p /dev/serial/by-id/YOUR_SENSOR -f 800 -r 16 -s capture.csv
 ```
 
-Press **Q**, Ctrl+C or send SIGTERM to request a verified stop. `-d` sets a host
-capture duration; `-t` sets the timeout in seconds (default 3). `-h` displays help;
-`-V` prints the wrapper/protocol version. Without `-s`, CSV is written to stdout.
+Press **Q** or **Ctrl+C** to stop. SIGTERM also requests a normal stop, including
+confirmation of the final sample count.
 
-CSV columns remain `time,x,y,z`. Times are device-relative seconds with six
-decimals; XYZ values are in g, derived from raw counts with ten decimals.
-`capture.csv.meta.json` records validity, session, sample count, effective rate
-and maximum observation window. Successful exit requires a matching final count
-and durable CSV output. Failed or interrupted captures exit nonzero and retain
-available partial data with `valid: false`; never use them for calibration.
-Existing CSV and metadata files are not overwritten. A successful short capture
-still may be too short or too quiet for input-shaping analysis.
+| Option | Purpose | Default |
+| --- | --- | --- |
+| `-p` | Sensor serial port | `/dev/ttyACM0` |
+| `-f` | Sampling rate: 200, 400, 800 or 1600 Hz | 1600 Hz |
+| `-r` | Full-scale range: 2, 4, 8 or 16 g | 2 g |
+| `-d` | Capture duration in seconds | Until stopped |
+| `-s` | CSV output path | Standard output |
+| `-t` | Communication timeout in seconds | 3 seconds |
+| `-h` | Show help | |
+| `-V` | Show wrapper and protocol version | |
 
-## OctoPrint compatibility
+Pass `-f 800` explicitly for the 800 Hz captures shown here. We don't change the
+rate or range automatically when a capture fails.
 
-The matching `OctoPrint-Pinput_Shaping` optimization branch already uses
-`-p PORT -f RATE -s FILE`, waits for `Press Q to stop`, checks CSV progress and
-requires successful process exit after Q. Those interfaces are preserved.
-The wrapper exports acquisition timing instead of host receipt timing, so the
-plugin can validate and analyze it without relaxing its quality gates.
+### Measurement range
 
-The plugin's pinned upstream installer still references legacy commit
-`02d01ba`. Until a reviewed protocol 2 revision is committed and published,
-install this local wrapper explicitly. Do not invent a new installer commit
-pin or assume that a plugin-only upgrade replaces the sensor firmware.
+| Range | CTRL6 | Raw counts/g |
+| --- | --- | ---: |
+| +/-2 g | 0x00 | 16384 |
+| +/-4 g | 0x10 | 8192 |
+| +/-8 g | 0x20 | 4096 |
+| +/-16 g | 0x30 | 2048 |
 
-## Validation
+We change only the full-scale bits in CTRL6. Low-pass filtering and the noise
+setting stay the same. At 16 g we use `0x30`; Klipper's `0x34` also enables
+LOW_NOISE. The sensor provides 14-bit measurements, left-aligned in the 16-bit
+registers we read.
 
-Tests compile the real C wrapper and run it through pseudo-terminals. A host
-C++ harness also executes the actual firmware source with simulated SPI and USB.
-It covers rates, raw units, partial USB writes, timestamp rollover, FIFO/software
-overflow, uncertain timing, missing data, clipping, initialization failure,
-checksums, sequence gaps, rate/session mismatch, disconnection and bounded stop.
-The harness also covers ten-second synthetic captures with SPI-call costs and
-delayed short USB packets, plus aborts across USB packet boundaries. These costs
-are injected test conditions, not measured target timings or USB guarantees.
+A wider range gives more acceleration headroom at the cost of resolution.
+For example, raw 2048 at 16 g and raw 16384 at 2 g both export as 1 g. These
+are nominal conversion factors; they don't calibrate sensor gain or offset.
 
-An optional integration check exercises the real plugin capturer and analyzer:
+The wrapper checks the requested range and scale against the firmware's READY
+response before accepting samples. A failed CTRL6 readback, incompatible scale
+or unsupported range stops the capture.
+
+With `-r 2`, or without `-r`, we use the original protocol-2 exchange. Older
+protocol-2 firmware works at 2 g; selecting 4, 8 or 16 g requires firmware with
+range selection. Each new capture without a range starts at 2 g, regardless of
+the previous capture.
+
+### CSV and metadata
+
+The CSV columns are `time,x,y,z`. Time is in device-relative seconds with six
+decimal places, and acceleration is in g with ten decimal places.
+
+We also write `capture.csv.meta.json`, which records:
+
+- Session, requested rate, effective rate and sample count.
+- Requested and confirmed range: `requested_range_g` and `range_g`.
+- Confirmed scale: `counts_per_g`.
+- Timing information and capture validity.
+
+If startup fails before the range is confirmed, `range_g` and `counts_per_g`
+are null. A later failure keeps the confirmed values but sets `valid` to false.
+We keep any partial CSV for diagnosis. Use only captures with a successful exit
+and `valid: true` for analysis. Existing CSV and metadata files aren't overwritten.
+
+## Clipping and other capture errors
+
+We reject a sample if any raw axis is `>=32760` or `<=-32760`, at every range.
+The firmware reports `Device error: CLIPPING:why=raw_limit:...` with the following
+details:
+
+| Field | Meaning |
+| --- | --- |
+| `seq`, `t_us` | Rejected sample's candidate index and device timestamp |
+| `x`, `y`, `z` | Original signed raw XYZ |
+| `hit` | Affected axes: X=1, Y=2, Z=4; combinations are added |
+| `fifo` | FIFO status before reading the sample, in hexadecimal |
+| `fs` | Configured range in g |
+| `c6` | Configured CTRL6 |
+| `c6v` | CTRL6 verified at startup |
+| `c6f` | CTRL6 read when clipping occurred |
+
+The CTRL6 values are hexadecimal. We save the original sample and timing
+before the extra register read. These diagnostics run only when clipping occurs.
+The wrapper also reports sample details if its own clipping check detects a
+near-rail value.
+
+The rejected firmware sample never reaches the CSV, and queued samples can be
+discarded on failure. The final `Captured N samples` count can therefore be
+lower than `seq`. A near-rail reading can come from physical saturation or an
+incorrect SPI read; the diagnostic values help us investigate which occurred.
+
+FIFO overflow, timing uncertainty and a full software buffer have separate
+error codes. Failed captures exit with code 2 and invalid metadata. To save the
+wrapper's messages alongside the CSV:
+
+```bash
+lis2dwusb -p /dev/ttyACM0 -f 800 -r 16 -d 50 -s capture.csv 2>capture.csv.log
+```
+
+See [the protocol documentation](docs/protocol.md) for frame layouts, CRC,
+timestamp behavior and error details.
+
+## OctoPrint
+
+We use LIS2DWUSB with OctoPrint-Pinput_Shaping. Its range selection uses the
+`lis2dwRange` setting and passes the range through `-r`. It checks wrapper
+support, the confirmed range and scale, and the capture metadata before analysis.
+
+New plugin configurations use 16 g and 800 Hz. When migrating existing saved
+settings, the plugin keeps the previous 2 g range. Check your saved setting
+before starting a measurement.
+
+If your installed plugin doesn't offer range selection, it will continue to
+capture at 2 g. Older analyzers may also reject wider-range metadata. Update the
+plugin, wrapper and RP2040 firmware as needed; installing the plugin alone
+doesn't update the firmware on the sensor. Use `lis2dwusb -h` to check the
+wrapper installed on your Pi.
+
+## Tests
+
+Our tests compile the C wrapper and run it through pseudo-terminals. We also
+run the firmware source in a C++ harness with simulated SPI and USB. You'll
+need Python, pytest and a C++ compiler:
+
+```bash
+python3 -m pytest -q
+```
+
+The tests cover all rates and ranges, physical-unit conversion, partial USB
+writes, clock rollover, FIFO and buffer overflow, clipping, failed register
+reads, CRC errors, missing samples, disconnects and stopping. We also check
+15-second streams at 800 Hz for every range and full-width clipping messages
+at every USB alignment.
+
+To include the plugin capturer and analyzer, run from a Python environment
+with OctoPrint and the plugin's dependencies installed:
 
 ```bash
 PINPUT_PLUGIN_ROOT=/path/to/OctoPrint-Pinput_Shaping python3 -m pytest -q
 ```
 
-Use the plugin's Python environment for this optional check. Hardware validation
-still needs repeated captures at the supported rates, timing/repeatability
-measurements and sensor checks while the OctoPrint host is under load.
+The pinned `btt_lis2dw` build uses 83,040 bytes of flash and 50,380 bytes of
+static RAM. We measure flash from the ELF load image; PlatformIO's 4,142-byte
+summary misses some sections in this setup. Static RAM doesn't include peak
+stack usage.
+
+Software tests use simulated devices. On the printer, check stationary gravity
+and axis orientation first, then repeat captures during excitation. Compare
+clipping, effective rate, timestamp gaps and jitter under normal USB and CPU
+load before using the measurements for calibration.
 
 ## License
 
-GPLv3, preserving the project's existing license declaration.
+GPLv3.

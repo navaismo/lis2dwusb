@@ -4,6 +4,7 @@ extern int raw_y, raw_z;
 extern unsigned ctrl6_reads, axes_reads;
 extern uint8_t fifo_flags;
 extern bool mutate_on_ctrl6_read;
+extern int ctrl6_readback_override, ctrl6_transfer_override;
 namespace mbed {
 struct SPI {
     SPI(int, int, int) {}
@@ -20,7 +21,8 @@ struct SPI {
             const int value = transfer(i < tx_size ? uint8_t(tx[i]) : 0xff);
             if (i < rx_size) rx[i] = char(value);
         }
-        return length;
+        return reading && transaction_address == 0x25 && ctrl6_transfer_override >= 0
+            ? ctrl6_transfer_override : length;
     }
     int transfer(int value) {
         ++fake_time;
@@ -49,6 +51,7 @@ struct SPI {
                 fifo_count = 7;
                 fake_time += 100000;
             }
+            if (ctrl6_readback_override >= 0) return ctrl6_readback_override;
         }
         if (transaction_address == 0x2f) {
             while (produce && registers[0x20] && registers[0x2e] && next_sample <= fake_time) {

@@ -37,14 +37,63 @@ count exactly matching all received samples. A disconnect, missing confirmation,
 sequence discontinuity, CRC failure or firmware ERROR cannot produce exit zero.
 No fallback to legacy host-timestamped data is supported.
 
+### Optional full-scale selection
+
+The legacy three-field START always selects +/-2 g and retains the original
+six-field READY response. A range-aware client may append a fourth START field:
+
+```text
+START,800,0123abcd,16
+READY,2,0123abcd,800,2048,POLL,16
+```
+
+The usual CRC suffix and newline apply to both messages. The last READY field
+is the actual range magnitude in g; the scale field is raw register counts/g.
+Only 2, 4, 8 and 16 are supported. An unsupported numeric selection produces
+`UNSUPPORTED_RANGE`; an empty field or surplus field produces `BAD_COMMAND`.
+An explicitly requested 2 g range also receives the extended READY. Every new
+START without a range returns to 2 g, including after a wider-range session.
+HELLO and protocol version 2 are unchanged; no unsolicited capability fields
+are added to responses used by old clients.
+
+The wrapper sends legacy START for omitted `-r` or `-r 2`; other selections
+require extended READY with the matching range, rate, scale, nonce and POLL
+clock. A missing range confirmation, mismatched scale or old firmware rejection
+is a failure, never an automatic fallback. Old firmware remains usable at 2 g;
+nondefault requests require range-aware firmware. No CSV sample is accepted
+before the selected scale is confirmed. A failed or incomplete startup CTRL6
+read or any readback mismatch produces SENSOR_CONFIG without READY.
+
 ## Acquisition and timestamp meaning
 
 The device reads WHO_AM_I=0x44, resets with a 100 ms deadline, enables BDU and
-auto-increment (CTRL2=0x0c), selects high-performance mode and +/-2 g, verifies
+auto-increment (CTRL2=0x0c), selects high-performance mode and the requested
+full scale, verifies
 registers, allows settling and enables continuous FIFO (FIFO_CTRL=0xc0).
 The first two FIFO samples are discarded. The firmware retains raw signed,
-left-aligned 14-bit output; the wrapper divides by 16384 counts/g rather than
-quantizing to integer milligravity.
+left-aligned 14-bit output; the wrapper divides by the verified counts/g rather
+than quantizing to integer milligravity.
+
+| Full scale | CTRL6 | FS[1:0], bits 5:4 | Raw counts/g | Nominal mg per 14-bit step |
+| --- | --- | --- | ---: | ---: |
+| +/-2 g | 0x00 | 00 | 16384 | 0.244140625 |
+| +/-4 g | 0x10 | 01 | 8192 | 0.48828125 |
+| +/-8 g | 0x20 | 10 | 4096 | 0.9765625 |
+| +/-16 g | 0x30 | 11 | 2048 | 1.953125 |
+
+DS11811 Rev 9 lists rounded sensitivities of 0.244, 0.488, 0.976 and 1.952
+mg/digit in high-performance mode. The table uses the nominal binary scale
+requested by this protocol. Four raw-register counts represent one effective
+14-bit step; retaining a 16-bit word does not add two bits of resolution.
+These conversion factors are not a physical gain or offset calibration.
+
+Klipper's [LIS2DW driver](https://github.com/Klipper3d/klipper/blob/master/klippy/extras/lis2dw.py)
+uses CTRL6=0x34 for 16 g, also enabling LOW_NOISE at bit 2. This implementation
+changes only FS[1:0]: BW_FILT remains 00 (ODR/2 at 800 Hz), FDS remains 0
+(low-pass), and LOW_NOISE remains 0. Consequently, the matching range setting
+here is 0x30. No Klipper sampling-rate or filtering/noise change is imported.
+The operator's `-f 800` remains 800 Hz with every range; the wrapper's existing
+1600 Hz default and explicit supported rates remain unchanged.
 
 The current board configuration has no assigned data-ready interrupt pin.
 Instead, the main loop polls the FIFO and brackets a transition from empty to
@@ -123,7 +172,7 @@ accepted-sample counter. `t_us` uses the same device epoch and observation-windo
 midpoint as accepted sample frames. `x/y/z` are the original signed register
 words. `hit` is a decimal bitmask: X=1, Y=2, Z=4; every crossing axis is included.
 `fifo` is the hexadecimal FIFO_SAMPLES byte observed before reading that sample.
-`fs` is the configured full-scale magnitude in g, still 2. `c6` is configured
+`fs` is the configured full-scale magnitude in g. `c6` is configured
 CTRL6, `c6v` is its verified startup readback, and `c6f` is a separate fault-time
 readback, all hexadecimal. The latter is read only after preserving the original
 candidate, timestamp, mask and FIFO status; XYZ is not read again. A fault-time
@@ -166,6 +215,13 @@ validates session, ODR, raw range, sequence, timestamps, observation windows,
 checksum and final count before reporting success. The metadata sidecar is
 written atomically and records validity and the device timing model. CSV flush,
 sync and close errors also prevent successful exit.
+
+Metadata also records `requested_range_g`, verified `range_g` and verified
+`counts_per_g`. Before a valid READY, the latter two are JSON null rather than
+an assumed scale. If a later failure invalidates a capture, confirmed range and
+scale remain available alongside `valid:false`. CSV remains `time,x,y,z` in
+seconds and g for every range. For example, raw Z=2048 at 16 g exports Z=1 g;
+raw Z=16384 at 2 g exports the same Z=1 g.
 
 Physical acquisition behavior, operating-system latency and repeatability
 remain unvalidated. The source tests and pseudo-terminal tests verify software

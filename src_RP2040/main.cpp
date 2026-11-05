@@ -20,7 +20,7 @@
 namespace {
 constexpr uint8_t WHO_AM_I = 0x0F, CTRL1 = 0x20, CTRL2 = 0x21, CTRL6 = 0x25;
 constexpr uint8_t OUT_X_L = 0x28, FIFO_CTRL = 0x2E, FIFO_SAMPLES = 0x2F;
-constexpr uint8_t CONFIGURED_CTRL6 = 0x00;
+uint8_t configured_ctrl6 = 0;
 uint8_t verified_ctrl6 = 0;
 constexpr size_t QUEUE_SIZE = 256;
 mbed::SPI spi(digitalPinToPinName(MOSI_PIN), digitalPinToPinName(MISO_PIN), digitalPinToPinName(SCK_PIN));
@@ -94,6 +94,16 @@ uint8_t readReg(uint8_t address) {
     digitalWrite(CS_PIN, HIGH);
     return uint8_t(rx[1]);
 }
+bool readConfigCtrl6(uint8_t &value) {
+    const char tx[2] = {char(CTRL6 | 0x80), 0};
+    char rx[2] = {};
+    digitalWrite(CS_PIN, LOW);
+    const int transferred = spi.write(tx, sizeof(tx), rx, sizeof(rx));
+    digitalWrite(CS_PIN, HIGH);
+    if (transferred != int(sizeof(tx))) return false;
+    value = uint8_t(rx[1]);
+    return true;
+}
 void readAxes(int16_t *axes) {
     const char tx[7] = {char(OUT_X_L | 0x80), 0, 0, 0, 0, 0, 0};
     char rx[7] = {};
@@ -145,11 +155,12 @@ __attribute__((noinline)) void failClipping(const int16_t *axes, uint8_t fifo_st
     const int size = snprintf(reason, sizeof(reason), "CLIPPING:why=raw_limit:seq=%" PRIu32
         ":t_us=%s:x=%d:y=%d:z=%d:hit=%u:fifo=%02X:fs=%u:c6=%02X:c6v=%02X:c6f=%02X",
         candidate, time, x, y, z, hit, unsigned(fifo_status),
-        2U << ((CONFIGURED_CTRL6 >> 4) & 3), unsigned(CONFIGURED_CTRL6),
+        2U << ((configured_ctrl6 >> 4) & 3), unsigned(configured_ctrl6),
         unsigned(startup_ctrl6), unsigned(fault_ctrl6));
     fail(size >= 0 && size_t(size) < sizeof(reason) ? reason : "CLIPPING:why=diagnostic_format");
 }
-bool configure(unsigned requested) {
+bool configure(unsigned requested, unsigned range = 2) {
+    if (!lis_range_valid(range)) return false;
     if (readReg(WHO_AM_I) != 0x44) return false;
     writeReg(CTRL2, 0x40);
     const uint64_t deadline = nowUs() + 100000;
@@ -157,14 +168,15 @@ bool configure(unsigned requested) {
         if (nowUs() >= deadline) return false;
         delay(1);
     }
-    // ST DS11811: BDU + address increment, high-performance mode, +/-2 g.
+    // ST DS11811: FS is CTRL6[5:4]; keep BW_FILT, FDS and LOW_NOISE unchanged.
     writeReg(CTRL2, 0x0C);
-    writeReg(CTRL6, CONFIGURED_CTRL6);
+    configured_ctrl6 = range == 16 ? 0x30 : range == 8 ? 0x20 : range == 4 ? 0x10 : 0x00;
+    writeReg(CTRL6, configured_ctrl6);
     const uint8_t odr = requested == 1600 ? 0x94 : requested == 800 ? 0x84 : requested == 400 ? 0x74 : 0x64;
     writeReg(CTRL1, odr);
     if (readReg(CTRL1) != odr || readReg(CTRL2) != 0x0C) return false;
-    const uint8_t ctrl6 = readReg(CTRL6);
-    if (ctrl6 != CONFIGURED_CTRL6) return false;
+    uint8_t ctrl6;
+    if (!readConfigCtrl6(ctrl6) || ctrl6 != configured_ctrl6) return false;
     verified_ctrl6 = ctrl6;
     delay(30);
     writeReg(FIFO_CTRL, 0);
@@ -175,10 +187,14 @@ bool configure(unsigned requested) {
 }
 void command(char *line) {
     if (!lis_unframe(line)) { fail("BAD_COMMAND_CRC"); return; }
+    if (!line[0] || line[strlen(line) - 1] == ',' || strstr(line, ",,")) {
+        fail("BAD_COMMAND"); return;
+    }
     char *save = nullptr;
     char *verb = strtok_r(line, ",", &save);
     char *argument = strtok_r(nullptr, ",", &save);
     char *third = strtok_r(nullptr, ",", &save);
+    char *fourth = strtok_r(nullptr, ",", &save);
     if (verb && !strcmp(verb, "HELLO") && argument && lis_token_valid(argument) && !third) {
         powerDown();
         queued = head = tail = 0;
@@ -195,13 +211,29 @@ void command(char *line) {
         if (!argument[0] || *end || requested > 1600 || !lis_rate_valid(unsigned(requested))) {
             fail("UNSUPPORTED_RATE"); return;
         }
-        if (!configure(unsigned(requested))) { fail("SENSOR_CONFIG"); return; }
+        unsigned range = 2;
+        if (fourth) {
+            const unsigned long selected = strtoul(fourth, &end, 10);
+            bool digits = fourth[0] != 0;
+            for (const char *p = fourth; *p; ++p) if (*p < '0' || *p > '9') digits = false;
+            if (!digits || *end || selected > 16 || !lis_range_valid(unsigned(selected))) {
+                fail("UNSUPPORTED_RANGE"); return;
+            }
+            range = unsigned(selected);
+        }
+        if (!configure(unsigned(requested), range)) { fail("SENSOR_CONFIG"); return; }
         rate = unsigned(requested);
         sequence = 0;
         formatted_samples = usb_writes = usb_busy = 0;
         epoch = last_empty = last_sample = last_tx = nowUs();
         active = true;
-        snprintf(control, sizeof(control), "READY,2,%s,%u,16384,POLL", token, unsigned(rate));
+        const unsigned actual_range = 2U << ((verified_ctrl6 >> 4) & 3);
+        if (fourth)
+            snprintf(control, sizeof(control), "READY,2,%s,%u,%u,POLL,%u", token,
+                     unsigned(rate), lis_counts_per_g(actual_range), actual_range);
+        else
+            snprintf(control, sizeof(control), "READY,2,%s,%u,%u,POLL", token,
+                     unsigned(rate), lis_counts_per_g(actual_range));
         return;
     }
     if (verb && !strcmp(verb, "STOP") && argument && !strcmp(argument, token) && !third && active) {

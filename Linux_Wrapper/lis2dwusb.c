@@ -19,7 +19,7 @@ enum State { HELLO, READY, STREAMING, STOPPING, COMPLETE, FAILED };
 struct Capture {
     enum State state;
     int fd;
-    unsigned rate;
+    unsigned rate, range, counts_per_g;
     char token[9];
     const char *error;
     FILE *csv;
@@ -94,13 +94,20 @@ static void line_received(struct Capture *capture, char *line) {
     if (rest) { fail(capture, "Too many frame fields"); return; }
     if (count == 3 && !strcmp(fields[0], "ERROR") && !strcmp(fields[1], capture->token)) {
         fprintf(stderr, "Device error: %s\n", fields[2]);
+        if (capture->state == READY && capture->range != 2
+                && (!strcmp(fields[2], "BAD_COMMAND") || !strcmp(fields[2], "UNSUPPORTED_RANGE"))) {
+            fail(capture, "Firmware does not support the requested range negotiation; upgrade firmware for -r"); return;
+        }
         fail(capture, "Firmware rejected or invalidated this capture"); return;
     }
     if (capture->state == HELLO) {
         if (count != 3 || strcmp(fields[0], "LIS2DWUSB") || strcmp(fields[2], capture->token)) return;
         if (strcmp(fields[1], "2")) { fail(capture, "Unsupported device protocol version"); return; }
         char command[48];
-        snprintf(command, sizeof(command), "START,%u,%s", capture->rate, capture->token);
+        if (capture->range == 2)
+            snprintf(command, sizeof(command), "START,%u,%s", capture->rate, capture->token);
+        else
+            snprintf(command, sizeof(command), "START,%u,%s,%u", capture->rate, capture->token, capture->range);
         if (!send_command(capture, command)) { fail(capture, "Could not send START"); return; }
         capture->start_sent = true;
         capture->state = READY;
@@ -108,17 +115,23 @@ static void line_received(struct Capture *capture, char *line) {
         return;
     }
     if (capture->state == READY) {
-        uint64_t actual, scale;
-        if (count != 6 || strcmp(fields[0], "READY") || strcmp(fields[1], "2")
+        uint64_t actual, scale, range = 2;
+        if (count == 6 && capture->range != 2 && !strcmp(fields[0], "READY")) {
+            fail(capture, "Firmware did not confirm range negotiation; upgrade firmware for -r"); return;
+        }
+        if ((count != 6 && count != 7) || strcmp(fields[0], "READY") || strcmp(fields[1], "2")
                 || strcmp(fields[2], capture->token) || !number(fields[3], &actual)
                 || actual != capture->rate || !number(fields[4], &scale)
-                || scale != LIS_COUNTS_PER_G || strcmp(fields[5], "POLL")) {
+                || scale != lis_counts_per_g(capture->range) || strcmp(fields[5], "POLL")
+                || (count == 7 && (!number(fields[6], &range) || range != capture->range))) {
             fail(capture, "Invalid READY: session, rate, scale or acquisition clock mismatch"); return;
         }
+        capture->counts_per_g = (unsigned)scale;
         capture->state = STREAMING;
         capture->started = now();
         capture->deadline = now() + capture->timeout;
         fprintf(stderr, "Protocol 2: %u Hz, device FIFO-edge timing, acceleration in g\nPress Q to stop\n", capture->rate);
+        fprintf(stderr, "Range: +/- %u g, %u counts/g (verified READY)\n", capture->range, capture->counts_per_g);
         return;
     }
     if (count == 3 && !strcmp(fields[0], "DONE")) {
@@ -156,14 +169,14 @@ static void line_received(struct Capture *capture, char *line) {
             for (unsigned axis = 0; axis < 3; ++axis)
                 if (axes[axis] >= 32760 || axes[axis] <= -32760) hit |= 1U << axis;
             fprintf(stderr, "Clipping diagnostic:source=wrapper:why=raw_limit:seq=%" PRIu64
-                ":t_us=%" PRIu64 ":x=%ld:y=%ld:z=%ld:hit=%u:fs=2:counts_per_g=%u\n",
-                sequence, timestamp, axes[0], axes[1], axes[2], hit, (unsigned)LIS_COUNTS_PER_G);
+                ":t_us=%" PRIu64 ":x=%ld:y=%ld:z=%ld:hit=%u:fs=%u:counts_per_g=%u\n",
+                sequence, timestamp, axes[0], axes[1], axes[2], hit, capture->range, capture->counts_per_g);
             fail(capture, "Sensor full-scale clipping"); return;
         }
     if (fprintf(capture->csv, "%" PRIu64 ".%06" PRIu64 ",%.10f,%.10f,%.10f\n",
             timestamp / 1000000, timestamp % 1000000,
-            axes[0] / (double)LIS_COUNTS_PER_G, axes[1] / (double)LIS_COUNTS_PER_G,
-            axes[2] / (double)LIS_COUNTS_PER_G) < 0) {
+            axes[0] / (double)capture->counts_per_g, axes[1] / (double)capture->counts_per_g,
+            axes[2] / (double)capture->counts_per_g) < 0) {
         fail(capture, "CSV write failed"); return;
     }
     if (!capture->samples) capture->first = timestamp;
@@ -180,14 +193,19 @@ static bool metadata(const char *path, const struct Capture *capture) {
     FILE *file = fd >= 0 ? fdopen(fd, "w") : NULL;
     bool ok = false;
     if (file) {
+        char range[12] = "null", scale[12] = "null";
+        if (capture->counts_per_g) {
+            snprintf(range, sizeof(range), "%u", capture->range);
+            snprintf(scale, sizeof(scale), "%u", capture->counts_per_g);
+        }
         double effective = capture->samples > 1 ?
             (capture->samples - 1) * 1e6 / (capture->last - capture->first) : 0;
         ok = fprintf(file, "{\n  \"protocol\": 2, \"valid\": %s, \"session\": \"%s\",\n"
             "  \"requested_rate\": %u, \"effective_rate\": %.6f, \"samples\": %" PRIu64 ",\n"
             "  \"clock\": \"rp2040_fifo_poll\", \"max_window_us\": %" PRIu64 ",\n"
-            "  \"units\": \"g\", \"counts_per_g\": 16384\n}\n",
+            "  \"units\": \"g\", \"requested_range_g\": %u, \"range_g\": %s, \"counts_per_g\": %s\n}\n",
             capture->state == COMPLETE ? "true" : "false", capture->token,
-            capture->rate, effective, capture->samples, capture->max_window) > 0;
+            capture->rate, effective, capture->samples, capture->max_window, capture->range, range, scale) > 0;
         if (fflush(file) || fsync(fd)) ok = false;
         if (fclose(file)) ok = false;
         if (ok && rename(temporary, path)) ok = false;
@@ -197,8 +215,8 @@ static bool metadata(const char *path, const struct Capture *capture) {
     return ok;
 }
 static void usage(const char *program) {
-    fprintf(stderr, "Usage: %s [-p PORT] [-f 200|400|800|1600] [-s FILE] [-t SECONDS] [-d SECONDS]\n"
-        "Defaults: /dev/ttyACM0, 1600 Hz, 3-second timeout. Q/Ctrl+C stops capture.\n"
+    fprintf(stderr, "Usage: %s [-p PORT] [-f 200|400|800|1600] [-r 2|4|8|16] [-s FILE] [-t SECONDS] [-d SECONDS]\n"
+        "Defaults: /dev/ttyACM0, 1600 Hz, +/-2 g, 3-second timeout. Q/Ctrl+C stops capture.\n"
         "-d sets a host duration; -s writes CSV plus FILE.meta.json. Protocol 2 firmware is required.\n", program);
 }
 static bool seconds(const char *text, double *value, bool allow_zero) {
@@ -209,17 +227,22 @@ static bool seconds(const char *text, double *value, bool allow_zero) {
 }
 int main(int argc, char **argv) {
     setlocale(LC_NUMERIC, "C");
-    struct Capture capture = {.state = HELLO, .fd = -1, .rate = 1600, .timeout = 3};
+    struct Capture capture = {.state = HELLO, .fd = -1, .rate = 1600, .range = 2, .timeout = 3};
     const char *port = "/dev/ttyACM0", *path = NULL;
     double duration = 0;
     int option;
-    while ((option = getopt(argc, argv, "hp:f:s:t:d:V")) != -1) {
+    while ((option = getopt(argc, argv, "hp:f:r:s:t:d:V")) != -1) {
         uint64_t rate;
         switch (option) {
         case 'h': usage(argv[0]); return 0;
         case 'V': puts("lis2dwusb 0.3.0 (protocol 2)"); return 0;
         case 'p': port = optarg; break;
         case 's': path = optarg; break;
+        case 'r':
+            if (!number(optarg, &rate) || rate > 16 || !lis_range_valid((unsigned)rate)) {
+                fprintf(stderr, "Range must be one of 2, 4, 8 or 16 g\n"); return 1;
+            }
+            capture.range = (unsigned)rate; break;
         case 'f':
             if (!number(optarg, &rate) || rate > 1600 || !lis_rate_valid((unsigned)rate)) {
                 fprintf(stderr, "Frequency must be one of 200, 400, 800 or 1600 Hz\n"); return 1;
@@ -286,7 +309,9 @@ int main(int argc, char **argv) {
         }
         if (now() >= capture.deadline) {
             fail(&capture, capture.state == HELLO ? "Protocol greeting timeout; upgrade legacy firmware if necessary" :
-                capture.state == STOPPING ? "STOP confirmation timeout; capture is invalid" : "Sensor readiness or sample timeout");
+                capture.state == STOPPING ? "STOP confirmation timeout; capture is invalid" :
+                capture.state == READY && capture.range != 2 ? "Range negotiation timeout; firmware may not support -r" :
+                "Sensor readiness or sample timeout");
             break;
         }
         struct pollfd descriptors[2] = {{capture.fd, POLLIN, 0}, {stdin_open ? STDIN_FILENO : -1, POLLIN, 0}};

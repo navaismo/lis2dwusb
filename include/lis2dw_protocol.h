@@ -7,7 +7,16 @@
 
 #define LIS_PROTOCOL_VERSION 2
 #define LIS_LINE_SIZE 160
+/* Legacy/default scale; negotiated captures use lis_counts_per_g(). */
 #define LIS_COUNTS_PER_G 16384
+
+static inline int lis_range_valid(unsigned range) {
+    return range == 2 || range == 4 || range == 8 || range == 16;
+}
+/* Raw registers retain the left-aligned 14-bit output, including two zero bits. */
+static inline unsigned lis_counts_per_g(unsigned range) {
+    return lis_range_valid(range) ? 32768U / range : 0;
+}
 
 /* CRC-16/CCITT-FALSE covers the payload before the asterisk. */
 static inline uint16_t lis_crc16_update(uint16_t crc, const char *data, size_t size) {

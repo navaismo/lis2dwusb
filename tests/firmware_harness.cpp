@@ -15,6 +15,7 @@ int raw_y = 0, raw_z = 16384;
 unsigned ctrl6_reads = 0, axes_reads = 0;
 uint8_t fifo_flags = 0;
 bool mutate_on_ctrl6_read = false;
+int ctrl6_readback_override = -1, ctrl6_transfer_override = -1;
 uint64_t next_sample = 0;
 unsigned sensor_period = 625;
 unsigned spi_call_cost_us = 0;
@@ -74,13 +75,58 @@ int main(int argc, char **argv) {
     if (scenario == "reset") reset_stuck = true;
     setup();
     assert(lis_crc16("123456789", 9) == 0x29b1);
+    if (scenario == "range_session") {
+        assert(argc >= 4);
+        const unsigned requested_range = unsigned(std::strtoul(argv[3], nullptr, 10));
+        const std::string fault = argc > 4 ? argv[4] : "normal";
+        feed("HELLO,1234abcd"); runFor(1000);
+        if (fault == "readback") ctrl6_readback_override = 0xFF;
+        if (fault == "filter_readback") ctrl6_readback_override = 0x34;
+        if (fault == "short_read") ctrl6_transfer_override = 1;
+        if (fault == "failed_read") ctrl6_transfer_override = 0;
+        if (lis_range_valid(requested_range)) {
+            raw_axis = int(lis_counts_per_g(requested_range) / 4);
+            raw_z = int(lis_counts_per_g(requested_range));
+        }
+        char start[128];
+        snprintf(start, sizeof(start), "START,800,1234abcd,%s", argv[3]);
+        feed(start); runFor(50000);
+        if (active) {
+            assert(fault == "normal" || fault == "clipping" || fault == "legacy_reset");
+            assert(registers[CTRL1] == 0x84 && registers[CTRL2] == 0x0C && registers[FIFO_CTRL] == 0xC0);
+            const unsigned ctrl6 = requested_range == 16 ? 0x30 : requested_range == 8 ? 0x20 : requested_range == 4 ? 0x10 : 0;
+            assert(registers[CTRL6] == ctrl6 && verified_ctrl6 == ctrl6 && configured_ctrl6 == ctrl6);
+            if (fault == "clipping") {
+                raw_axis = 32764; raw_y = -32768; raw_z = 32760;
+                runFor(3000);
+                assert(!active);
+            } else {
+                runFor(15000000);
+                feed("STOP,1234abcd"); runFor(20000);
+                assert(sequence >= 800 * 15 && !active);
+            }
+            if (fault == "legacy_reset") {
+                drain();
+                feed("HELLO,1234abcd"); runFor(1000);
+                raw_axis = 4096; raw_y = 0; raw_z = 16384;
+                feed("START,800,1234abcd"); runFor(50000);
+                assert(active && configured_ctrl6 == 0 && verified_ctrl6 == 0 && registers[CTRL6] == 0);
+                feed("STOP,1234abcd"); runFor(20000);
+            }
+        }
+        assert(!active && registers[CTRL1] == 0 && registers[FIFO_CTRL] == 0);
+        drain();
+        std::cout << _SerialUSB.output;
+        return 0;
+    }
     if (scenario == "clipping_format" || scenario == "clipping_candidate") {
         assert(argc >= 6);
         const int16_t axes[] = {int16_t(std::stoi(argv[3])), int16_t(std::stoi(argv[4])),
                                 int16_t(std::stoi(argv[5]))};
         strcpy(token, "1234abcd");
-        assert(configure(800));
-        assert(ctrl6_reads == 1 && verified_ctrl6 == 0 && discard == 2);
+        const unsigned range = scenario == "clipping_format" && argc > 7 ? unsigned(std::stoul(argv[7])) : 2;
+        assert(configure(800, range));
+        assert(ctrl6_reads == 1 && verified_ctrl6 == configured_ctrl6 && discard == 2);
         registers[CTRL6] = 0x30;
         mutate_on_ctrl6_read = true;
         bool diagnostic_expected = true;

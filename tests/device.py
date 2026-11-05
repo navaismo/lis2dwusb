@@ -16,13 +16,15 @@ def frame(payload):
 
 
 class Device:
-    def __init__(self, binary, output, *, rate=1600, count=128, fault=None, records=None, error_reason=None):
+    def __init__(self, binary, output, *, rate=1600, count=128, fault=None, records=None, error_reason=None,
+                 full_scale=2, ready_payload=None, extra_args=()):
         self.master, self.slave = pty.openpty()
         self.port = os.ttyname(self.slave)
         self.binary, self.output = binary, output
         self.rate, self.count, self.fault = rate, count, fault
         self.records = records
         self.error_reason = error_reason
+        self.full_scale, self.ready_payload, self.extra_args = full_scale, ready_payload, extra_args
         self.error = None
         self.token = None
         self.ready = threading.Event()
@@ -34,8 +36,9 @@ class Device:
         self.process = None
 
     def start(self):
+        range_args = ['-r', str(self.full_scale)] if self.full_scale != 2 else []
         self.process = subprocess.Popen([str(self.binary), '-p', self.port, '-f', str(self.rate),
-            '-s', str(self.output), '-t', '0.3'], stdin=subprocess.PIPE,
+            '-s', str(self.output), '-t', '0.3', *range_args, *self.extra_args], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.thread.start()
         return self
@@ -82,10 +85,23 @@ class Device:
             start = self.command()
             if start is None:
                 return
-            assert start == ['START', str(self.rate), self.token]
+            assert start == ['START', str(self.rate), self.token] + ([str(self.full_scale)] if self.full_scale != 2 else [])
+            if self.fault == 'range_unsupported':
+                self.write(frame(f'ERROR,{self.token},BAD_COMMAND'))
+                self.command()
+                return
+            if self.fault == 'range_timeout':
+                self.command()
+                return
             actual = 800 if self.fault == 'rate' else self.rate
             token = 'badbad00' if self.fault == 'nonce' else self.token
-            self.write(frame(f'READY,2,{token},{actual},16384,POLL'))
+            scale = 32768 // self.full_scale
+            ready = f'READY,2,{token},{actual},{scale},POLL'
+            if self.full_scale != 2:
+                ready += f',{self.full_scale}'
+            if self.ready_payload is not None:
+                ready = self.ready_payload.format(token=token, rate=actual)
+            self.write(frame(ready))
             self.ready.set()
             if self.fault in ('rate', 'nonce'):
                 self.command()
@@ -116,8 +132,8 @@ class Device:
                 if self.fault == 'time_gap' and index >= 64:
                     timestamp += 1000000 // self.rate * 3
                 window = 9999 if self.fault == 'uncertainty' else 20
-                axis = 32760 if self.fault == 'clipping' else int(1024 * math.sin(2 * math.pi * 50 * index / self.rate)) * 4
-                record = frame(f'S,{sequence},{timestamp},{axis},0,16384,{window}')
+                axis = 32760 if self.fault == 'clipping' else int(scale / 16 * math.sin(2 * math.pi * 50 * index / self.rate)) * 4
+                record = frame(f'S,{sequence},{timestamp},{axis},0,{scale},{window}')
                 if self.fault == 'crc' and index == 64:
                     record = record[:-3] + b'ZZ\n'
                 rows.append(record)

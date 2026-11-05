@@ -1,37 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TOTAL=2
-CURRENT=1
-
-# Function to show step
-step() {
-    echo -e "\n[$CURRENT/$TOTAL] $1..."
-    ((CURRENT++))
-}
-
-# Step 1: Installing Deps
-step "Installing Deps"
-sudo apt-get update
-sudo apt-get install -y build-essential make gcc git pigpio
-
-# Step 2: installing LIS2DWUSB Tool (workaround para git como root)
-step "Installing LIS2DWUSB Tool"
-
-# We detect the real user (for when the script is executed with Sudo)
-CLONE_USER="${SUDO_USER:-$USER}"
-
-sudo make
-sudo make install
-
-if [ "$(id -u)" -eq 0 ]; then
-    echo "Cloning as $CLONE_USER to avoid Git root warning..."
-    sudo -u "$CLONE_USER" echo -e "octoprint ALL=(ALL) NOPASSWD: $(which lis2dwusb)\n$CLONE_USER ALL=(ALL) NOPASSWD: $(which lis2dwusb)" |
-        sudo tee /etc/sudoers.d/octoprint_lis2dw
-
-else
-    echo -e "octoprint ALL=(ALL) NOPASSWD: $(which lis2dwusb)\n$(whoami) ALL=(ALL) NOPASSWD: $(which lis2dwusb)" |
-        sudo tee /etc/sudoers.d/octoprint_lis2dw
+if [[ $(id -u) -ne 0 ]]; then
+    echo "Run as root with OCTOPRINT_USER set to the service account." >&2
+    exit 1
 fi
-echo -e "\n✔ All steps completed successfully!"
-echo -e "Reboot the system to apply changes.\n"
+service_user=${OCTOPRINT_USER:-${SUDO_USER:-}}
+if [[ ! $service_user =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || ! id "$service_user" >/dev/null 2>&1 || [[ $(id -u "$service_user") -eq 0 ]]; then
+    echo "Set OCTOPRINT_USER to an existing, non-root OctoPrint service account." >&2
+    exit 1
+fi
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+getent group dialout >/dev/null || { echo "The dialout serial group is required." >&2; exit 1; }
+apt-get update
+apt-get install -y build-essential make
+make -C "$script_dir" install
+usermod -a -G dialout "$service_user"
+echo "Installed the protocol 2 wrapper. Restart the OctoPrint service to refresh group membership."
+echo "Flash matching firmware separately after review. No firmware was uploaded by this installer."

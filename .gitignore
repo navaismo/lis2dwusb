@@ -1,8 +1,10 @@
-.pio
-.vscode
-.git
-test
-lis2dwusb
-tests/__pycache__/
+.pio/
+.vscode/
+.pytest_cache/
+**/__pycache__/
 *.pyc
+/lis2dwusb
+/Linux_Wrapper/lis2dwusb
+*.csv
+*.csv.meta.json
 *.zip
